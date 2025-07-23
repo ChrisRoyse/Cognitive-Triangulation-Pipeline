@@ -67,7 +67,7 @@ class DeepSeekClient {
             const cachedResponse = await this.cacheManager.get(promptContent, options);
             if (cachedResponse) {
                 this.logger.info('Cache hit - returning cached response', {
-                    cacheKey: cacheKey.substring(0, 20) + '...'
+                    promptPreview: promptContent.substring(0, 50) + '...'
                 });
                 return cachedResponse;
             }

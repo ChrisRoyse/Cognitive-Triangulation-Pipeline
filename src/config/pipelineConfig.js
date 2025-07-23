@@ -26,13 +26,14 @@ class PipelineConfig {
         const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
         if (forcedConcurrency > 0) {
             console.log(`🎯 Distributing FORCE_MAX_CONCURRENCY=${forcedConcurrency} across worker types`);
-            // Distribute the total concurrency across worker types based on priority
+            // File-analysis is the core cognitive triangulation worker - give it all workers
+            // Other workers are mostly single-threaded coordination tasks
             this.workerLimits = {
-                'file-analysis': Math.floor(forcedConcurrency * 0.4),           // 40% for file analysis (most important)
-                'relationship-resolution': Math.floor(forcedConcurrency * 0.3),  // 30% for relationships
-                'directory-aggregation': Math.floor(forcedConcurrency * 0.1),    // 10% for directory
-                'validation': Math.floor(forcedConcurrency * 0.15),              // 15% for validation
-                'graph-ingestion': Math.floor(forcedConcurrency * 0.05)          // 5% for graph
+                'file-analysis': parseInt(forcedConcurrency),                    // All workers for cognitive triangulation
+                'relationship-resolution': 5,                                   // Minimal for coordination
+                'directory-aggregation': 5,                                     // Minimal for coordination  
+                'validation': 5,                                                 // Minimal for coordination
+                'graph-ingestion': 5                                             // Minimal for coordination
             };
             
             // Ensure at least 1 worker per type
