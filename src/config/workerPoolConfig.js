@@ -64,8 +64,8 @@ class WorkerPoolConfig {
      * Get global configuration
      */
     getGlobalConfig() {
-        // HARD LIMIT: Never exceed 150 concurrent agents
-        const ABSOLUTE_MAX_CONCURRENCY = 150;
+        // HARD LIMIT: 100 total concurrent LLM API calls across ALL workers
+        const ABSOLUTE_MAX_CONCURRENCY = 100;
         
         // Check for forced override first
         const forcedConcurrency = process.env.FORCE_MAX_CONCURRENCY;
@@ -111,9 +111,9 @@ class WorkerPoolConfig {
         }
         
         return {
-            maxGlobalConcurrency: Math.min(Math.max(maxGlobalConcurrency, 5), ABSOLUTE_MAX_CONCURRENCY),
+            maxGlobalConcurrency: ABSOLUTE_MAX_CONCURRENCY, // 100 total across all workers
             minWorkerConcurrency: 1,
-            maxWorkerConcurrency: this.environment === 'production' ? 25 : 50,
+            maxWorkerConcurrency: 50, // Max per worker type, but total still capped at 100
             
             // Resource thresholds
             cpuThreshold: this.environment === 'production' ? 75 : 80,
@@ -155,8 +155,8 @@ class WorkerPoolConfig {
         return {
             'file-analysis': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 3 : 5) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 15 : 20) * maxScale), 40),
+                baseConcurrency: 8,
+                maxConcurrency: 40, // Part of total 100 limit
                 minConcurrency: 1,
                 jobTimeout: 180000, // 3 minutes for LLM calls
                 retryAttempts: 2,
@@ -167,8 +167,8 @@ class WorkerPoolConfig {
             
             'llm-analysis': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 2 : 3) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 10 : 15) * maxScale), 30),
+                baseConcurrency: 6,
+                maxConcurrency: 30, // Part of total 100 limit
                 minConcurrency: 1,
                 jobTimeout: 240000, // 4 minutes for complex LLM analysis
                 retryAttempts: 2,
@@ -179,8 +179,8 @@ class WorkerPoolConfig {
             
             'validation': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 6 : 8) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 20 : 30) * maxScale), 50),
+                baseConcurrency: 4,
+                maxConcurrency: 15, // Part of total 100 limit
                 minConcurrency: 2,
                 jobTimeout: 60000, // 1 minute for validation
                 retryAttempts: 3,
@@ -191,8 +191,8 @@ class WorkerPoolConfig {
             
             'graph-ingestion': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 4 : 6) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 15 : 25) * maxScale), 40),
+                baseConcurrency: 2,
+                maxConcurrency: 5, // Part of total 100 limit  
                 minConcurrency: 1,
                 jobTimeout: 120000, // 2 minutes for graph operations
                 retryAttempts: 3,
@@ -203,8 +203,8 @@ class WorkerPoolConfig {
             
             'directory-aggregation': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 3 : 4) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 12 : 20) * maxScale), 30),
+                baseConcurrency: 2,
+                maxConcurrency: 5, // Part of total 100 limit
                 minConcurrency: 1,
                 jobTimeout: 90000, // 1.5 minutes
                 retryAttempts: 2,
@@ -215,8 +215,8 @@ class WorkerPoolConfig {
             
             'relationship-resolution': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 3 : 4) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 12 : 20) * maxScale), 30),
+                baseConcurrency: 3,
+                maxConcurrency: 10, // Part of total 100 limit
                 minConcurrency: 1,
                 jobTimeout: 150000, // 2.5 minutes
                 retryAttempts: 2,
@@ -227,8 +227,8 @@ class WorkerPoolConfig {
             
             'global-resolution': {
                 ...baseConfig,
-                baseConcurrency: Math.floor((this.environment === 'production' ? 2 : 3) * baseScale),
-                maxConcurrency: Math.min(Math.floor((this.environment === 'production' ? 8 : 15) * maxScale), 25),
+                baseConcurrency: 2,
+                maxConcurrency: 5, // Part of total 100 limit
                 minConcurrency: 1,
                 jobTimeout: 200000, // 3.3 minutes
                 retryAttempts: 2,
@@ -502,9 +502,9 @@ class WorkerPoolConfig {
             // Scaling limits
             limits: {
                 minConcurrencyGlobal: 3,
-                maxConcurrencyGlobal: this.config?.global?.maxGlobalConcurrency || 50,
+                maxConcurrencyGlobal: this.config?.global?.maxGlobalConcurrency || 100,
                 minConcurrencyPerWorker: 1,
-                maxConcurrencyPerWorker: this.config?.global?.maxWorkerConcurrency || 25
+                maxConcurrencyPerWorker: this.config?.global?.maxWorkerConcurrency || 50
             },
             
             // Advanced scaling

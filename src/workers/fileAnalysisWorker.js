@@ -5,6 +5,7 @@ const { Worker } = require('bullmq');
 const LLMResponseSanitizer = require('../utils/LLMResponseSanitizer');
 const { getTokenizer } = require('../utils/tokenizer');
 const { ManagedWorker } = require('./ManagedWorker');
+const { PipelineConfig } = require('../config/pipelineConfig');
 
 const MAX_INPUT_TOKENS = 50000; // Leave a buffer for the prompt template
 const MAX_INPUT_CHARS = 60000; // Character limit to stay well within DeepSeek's 64K token limit
@@ -18,33 +19,42 @@ class FileAnalysisWorker {
         this.workerPoolManager = workerPoolManager;
         this.directoryAggregationQueue = this.queueManager.getQueue('directory-aggregation-queue');
         this.tokenizer = getTokenizer();
+        
+        // Use centralized configuration
+        this.config = options.pipelineConfig || PipelineConfig.createDefault();
+        const workerLimit = this.config.getWorkerLimit('file-analysis');
+        const apiRateLimit = this.config.performance.apiRateLimit;
 
         if (!options.processOnly) {
             if (workerPoolManager) {
-                // Create managed worker with intelligent concurrency control
+                // Create managed worker with centralized configuration
                 this.managedWorker = new ManagedWorker('file-analysis-queue', workerPoolManager, {
                     workerType: 'file-analysis',
-                    baseConcurrency: 5, // Conservative starting point for LLM calls
-                    maxConcurrency: 20, // Reduced from 100 to prevent API overwhelm
+                    baseConcurrency: Math.min(5, workerLimit), // Conservative starting point
+                    maxConcurrency: workerLimit, // Use centralized limit
                     minConcurrency: 1,
-                    rateLimitRequests: 8, // 8 requests per second for DeepSeek
+                    rateLimitRequests: Math.floor(apiRateLimit / 2), // Reserve half for file analysis
                     rateLimitWindow: 1000,
-                    failureThreshold: 3, // Lower threshold for LLM failures
-                    resetTimeout: 90000, // 90 seconds
-                    jobTimeout: 180000, // 3 minutes for file analysis
-                    retryAttempts: 2,
-                    retryDelay: 10000,
+                    failureThreshold: 3,
+                    resetTimeout: 90000,
+                    jobTimeout: this.config.performance.maxExecutionTime / 10, // 10% of total time per file
+                    retryAttempts: this.config.performance.apiRetryAttempts,
+                    retryDelay: this.config.performance.apiRetryDelay,
                     ...options
                 });
+                
+                console.log(`✅ FileAnalysisWorker configured: ${workerLimit} max concurrency, ${this.managedWorker.options.rateLimitRequests} req/s`);
                 
                 // Initialize the managed worker
                 this.initializeWorker();
             } else {
-                // Fallback to basic worker if no WorkerPoolManager
+                // Fallback to basic worker with centralized concurrency
                 this.worker = new Worker('file-analysis-queue', this.process.bind(this), {
                     connection: this.queueManager.connection,
-                    concurrency: options.concurrency || 3 // Conservative concurrency for LLM calls
+                    concurrency: options.concurrency || Math.min(3, workerLimit)
                 });
+                
+                console.log(`✅ FileAnalysisWorker (basic) configured: ${this.worker.opts.concurrency} concurrency`);
             }
         }
     }

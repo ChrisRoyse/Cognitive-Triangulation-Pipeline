@@ -1,6 +1,7 @@
 const Database = require('better-sqlite3');
 const fs = require('fs');
 const path = require('path');
+const { MigrationManager } = require('./migrationManager');
 
 /**
  * Manages a connection to a SQLite database.
@@ -35,18 +36,18 @@ class DatabaseManager {
     /**
      * Initializes the database with the schema.
      */
-    initializeDb() {
+    async initializeDb() {
         const db = this.getDb();
         const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
         db.exec(schema);
-        this.applyMigrations();
+        await this.applyMigrations();
     }
 
     /**
      * Deletes and rebuilds the database from the schema.
      * Ensures a clean state, primarily for testing.
      */
-    rebuildDb() {
+    async rebuildDb() {
         if (this.db) {
             this.db.close();
             this.db = null;
@@ -54,75 +55,27 @@ class DatabaseManager {
         if (fs.existsSync(this.dbPath)) {
             fs.unlinkSync(this.dbPath);
         }
-        this.initializeDb();
+        await this.initializeDb();
     }
 
     /**
-     * Applies schema migrations to the database.
+     * Applies schema migrations to the database using the new migration system.
      */
-    applyMigrations() {
-        const db = this.getDb();
-        const version = db.pragma('user_version', { simple: true });
-
-        if (version < 1) {
-            const migrateToV1 = db.transaction(() => {
-                const columns = db.pragma('table_info(relationships)');
-                const columnNames = columns.map(col => col.name);
-                
-                let migrationSql = '';
-
-                if (!columnNames.includes('status')) {
-                    migrationSql += 'ALTER TABLE relationships ADD COLUMN status TEXT;';
-                }
-
-                if (!columnNames.includes('confidence_score')) {
-                    // This is a no-op, as the column already exists in the base schema.
-                    // This check is kept for backwards compatibility with older databases.
-                }
-                
-                migrationSql += `
-                    CREATE TABLE IF NOT EXISTS relationship_evidence (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        relationshipId INTEGER NOT NULL,
-                        runId TEXT NOT NULL,
-                        evidencePayload TEXT NOT NULL,
-                        FOREIGN KEY (relationshipId) REFERENCES relationships (id) ON DELETE CASCADE
-                    );
-                `;
-
-                if(migrationSql.trim().length > 0) {
-                    db.exec(migrationSql);
-                }
-
-                db.pragma('user_version = 1');
-            });
-
-            try {
-                migrateToV1();
-            } catch (error) {
-                console.error('Migration to V1 failed:', error);
-            }
+    async applyMigrations() {
+        try {
+            const migrationManager = new MigrationManager(this.getDb());
+            await migrationManager.runPendingMigrations();
+        } catch (error) {
+            console.error('❌ Database migration failed:', error.message);
+            throw error;
         }
+    }
 
-        if (version < 2) {
-            const migrateToV2 = db.transaction(() => {
-                // Add relationship_hash column to relationship_evidence table
-                const evidenceColumns = db.pragma('table_info(relationship_evidence)');
-                const evidenceColumnNames = evidenceColumns.map(col => col.name);
-                
-                if (!evidenceColumnNames.includes('relationship_hash')) {
-                    db.exec('ALTER TABLE relationship_evidence ADD COLUMN relationship_hash TEXT;');
-                }
-
-                db.pragma('user_version = 2');
-            });
-
-            try {
-                migrateToV2();
-            } catch (error) {
-                console.error('Migration to V2 failed:', error);
-            }
-        }
+    /**
+     * Get migration manager instance for manual migration operations
+     */
+    getMigrationManager() {
+        return new MigrationManager(this.getDb());
     }
 
     /**

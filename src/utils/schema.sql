@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS directory_summaries (
 
 CREATE TABLE IF NOT EXISTS relationship_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    relationship_id INTEGER NOT NULL,
+    relationship_id INTEGER,
     run_id TEXT NOT NULL,
     evidence_payload TEXT NOT NULL,
     relationship_hash TEXT,

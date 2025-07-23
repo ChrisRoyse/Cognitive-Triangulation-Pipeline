@@ -15,28 +15,29 @@ const TransactionalOutboxPublisher = require('./services/TransactionalOutboxPubl
 const config = require('./config');
 const { v4: uuidv4 } = require('uuid');
 const { getDeepseekClient } = require('./utils/deepseekClient');
+const { PipelineConfig } = require('./config/pipelineConfig');
 
 class CognitiveTriangulationPipeline {
-    constructor(targetDirectory, dbPath = './database.db') {
+    constructor(targetDirectory, dbPath = './database.db', options = {}) {
         this.targetDirectory = targetDirectory;
         this.dbPath = dbPath;
         this.runId = uuidv4();
         this.queueManager = getQueueManagerInstance();
         this.dbManager = new DatabaseManager(this.dbPath);
         
-        // Initialize database schema early to avoid table not found errors
-        this.dbManager.initializeDb();
-        console.log('🚀 [main.js] Database schema initialized in constructor.');
+        // Use centralized configuration
+        this.pipelineConfig = options.pipelineConfig || PipelineConfig.createDefault();
+        console.log('🔧 Pipeline Configuration:', this.pipelineConfig.getSummary());
         
         this.cacheClient = getCacheClient();
         this.llmClient = getDeepseekClient();
         
-        // Initialize WorkerPoolManager for intelligent concurrency control
+        // Initialize WorkerPoolManager using centralized config
         this.workerPoolManager = new WorkerPoolManager({
-            environment: process.env.NODE_ENV || 'development',
-            maxGlobalConcurrency: parseInt(process.env.FORCE_MAX_CONCURRENCY) || parseInt(process.env.MAX_GLOBAL_CONCURRENCY) || undefined, // Use forced override or default calculation
-            cpuThreshold: parseInt(process.env.CPU_THRESHOLD) || 80,
-            memoryThreshold: parseInt(process.env.MEMORY_THRESHOLD) || 85
+            environment: this.pipelineConfig.environment,
+            maxGlobalConcurrency: this.pipelineConfig.TOTAL_WORKER_CONCURRENCY,
+            cpuThreshold: this.pipelineConfig.performance.cpuThreshold,
+            memoryThreshold: this.pipelineConfig.performance.memoryThreshold
         });
         
         this.outboxPublisher = new TransactionalOutboxPublisher(this.dbManager, this.queueManager);
@@ -50,6 +51,11 @@ class CognitiveTriangulationPipeline {
 
     async initialize() {
         console.log('🚀 [main.js] Initializing Cognitive Triangulation v2 Pipeline...');
+        
+        // Initialize database schema with migrations
+        await this.dbManager.initializeDb();
+        console.log('🚀 [main.js] Database schema initialized with migrations.');
+        
         await this.queueManager.connect();
         await this.clearDatabases();
         console.log('✅ [main.js] Databases and clients initialized successfully');
@@ -94,13 +100,14 @@ class CognitiveTriangulationPipeline {
         console.log('🚀 [main.js] Starting managed workers with intelligent concurrency control...');
         
         try {
-            // Create and initialize workers with WorkerPoolManager
+            // Create and initialize workers with centralized configuration
             const fileAnalysisWorker = new FileAnalysisWorker(
                 this.queueManager, 
                 this.dbManager, 
                 this.cacheClient, 
                 this.llmClient, 
-                this.workerPoolManager
+                this.workerPoolManager,
+                { pipelineConfig: this.pipelineConfig }
             );
             this.workers.push(fileAnalysisWorker);
             

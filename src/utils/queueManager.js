@@ -1,6 +1,8 @@
 const { Queue, Worker } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('../../config/index.js');
+const { QueueCleanupManager } = require('./queueCleanupManager.js');
+const { PipelineConfig } = require('../config/pipelineConfig.js');
 
 const FAILED_JOBS_QUEUE_NAME = 'failed-jobs';
 
@@ -20,6 +22,8 @@ class QueueManager {
     this.activeQueues = new Map();
     this.connection = null;
     this.isConnected = false;
+    this.cleanupManager = null;
+    this.pipelineConfig = null;
 
     this.connection = new IORedis(config.REDIS_URL, {
       maxRetriesPerRequest: null,
@@ -29,6 +33,7 @@ class QueueManager {
     this.connection.on('connect', () => {
       this.isConnected = true;
       console.log('Successfully connected to Redis.');
+      this._initializeCleanupManager();
     });
 
     this.connection.on('error', (err) => {
@@ -98,6 +103,16 @@ class QueueManager {
   async closeConnections() {
     console.log('Closing all active queues, workers, and the main Redis connection...');
 
+    // Stop cleanup manager first
+    if (this.cleanupManager) {
+      try {
+        await this.cleanupManager.stop();
+        console.log('✅ Cleanup manager stopped');
+      } catch (error) {
+        console.error('❌ Error stopping cleanup manager:', error);
+      }
+    }
+
     const closePromises = [
       ...Array.from(this.activeQueues.values()).map(q => q.close()),
       ...this.workers.map(w => w.close()),
@@ -111,6 +126,7 @@ class QueueManager {
 
     this.activeQueues.clear();
     this.workers = [];
+    this.cleanupManager = null;
     console.log('All connections have been closed.');
   }
 
@@ -155,6 +171,122 @@ class QueueManager {
         jobCounts.delayed += counts.delayed;
     }
     return jobCounts;
+  }
+
+  // ========== CLEANUP MANAGER INTEGRATION ==========
+
+  /**
+   * Initialize the cleanup manager with pipeline configuration
+   */
+  _initializeCleanupManager() {
+    try {
+      if (!this.pipelineConfig) {
+        this.pipelineConfig = new PipelineConfig();
+      }
+
+      const cleanupConfig = this.pipelineConfig.getCleanupConfig();
+      this.cleanupManager = new QueueCleanupManager(this, cleanupConfig);
+
+      // Start the cleanup manager automatically
+      this.cleanupManager.start().catch(error => {
+        console.error('❌ Failed to start cleanup manager:', error);
+      });
+
+      console.log('✅ Queue cleanup manager initialized and started');
+    } catch (error) {
+      console.error('❌ Failed to initialize cleanup manager:', error);
+    }
+  }
+
+  /**
+   * Get the cleanup manager instance
+   */
+  getCleanupManager() {
+    return this.cleanupManager;
+  }
+
+  /**
+   * Clean stale jobs from all queues
+   */
+  async cleanStaleJobs(queueName = null, maxAge = null) {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized');
+      return { processed: 0, cleaned: 0, errors: 1 };
+    }
+
+    return await this.cleanupManager.cleanStaleJobs(queueName, maxAge);
+  }
+
+  /**
+   * Clean failed jobs from all queues
+   */
+  async cleanFailedJobs(queueName = null, retentionCount = null) {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized');
+      return { processed: 0, cleaned: 0, errors: 1 };
+    }
+
+    return await this.cleanupManager.cleanFailedJobs(queueName, retentionCount);
+  }
+
+  /**
+   * Clean completed jobs from all queues
+   */
+  async cleanCompletedJobs(queueName = null, retentionCount = null) {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized');
+      return { processed: 0, cleaned: 0, errors: 1 };
+    }
+
+    return await this.cleanupManager.cleanCompletedJobs(queueName, retentionCount);
+  }
+
+  /**
+   * Clear stuck jobs that are blocking workers
+   */
+  async clearStuckJobs(queueName = null) {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized');
+      return { processed: 0, cleaned: 0, errors: 1 };
+    }
+
+    return await this.cleanupManager.clearStuckJobs(queueName);
+  }
+
+  /**
+   * Get queue health status
+   */
+  async getQueueHealth(queueName = null) {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized');
+      return { overall: 'unknown', error: 'Cleanup manager not available' };
+    }
+
+    return await this.cleanupManager.getQueueHealth(queueName);
+  }
+
+  /**
+   * Get cleanup metrics
+   */
+  getCleanupMetrics() {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized');
+      return { error: 'Cleanup manager not available' };
+    }
+
+    return this.cleanupManager.getMetrics();
+  }
+
+  /**
+   * Emergency cleanup - clear all queues (requires confirmation)
+   */
+  async emergencyCleanup(confirmation = false) {
+    if (!this.cleanupManager) {
+      console.warn('⚠️  Cleanup manager not initialized, falling back to basic clear');
+      return await this.clearAllQueues();
+    }
+
+    return await this.cleanupManager.clearAllQueues(confirmation);
   }
 }
 

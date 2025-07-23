@@ -21,8 +21,8 @@ class WorkerPoolManager extends EventEmitter {
         // Set environment first
         const environment = options.environment || process.env.NODE_ENV || 'development';
         
-        // HARD LIMIT: Never exceed 150 concurrent agents
-        const ABSOLUTE_MAX_CONCURRENCY = 150;
+        // HARD LIMIT: 100 total concurrent LLM API calls across ALL workers
+        const ABSOLUTE_MAX_CONCURRENCY = 100;
         
         // Get high performance mode flag early
         const highPerformanceMode = process.env.HIGH_PERFORMANCE_MODE === 'true';
@@ -38,7 +38,7 @@ class WorkerPoolManager extends EventEmitter {
                 ABSOLUTE_MAX_CONCURRENCY
             ),
             minWorkerConcurrency: options.minWorkerConcurrency || 1,
-            maxWorkerConcurrency: options.maxWorkerConcurrency || 75, // Increased to support 150 agents
+            maxWorkerConcurrency: options.maxWorkerConcurrency || 50, // Max per worker type within 100 total
             
             // Resource monitoring
             cpuThreshold: options.cpuThreshold || parseInt(process.env.CPU_THRESHOLD) || 80, // CPU % threshold
