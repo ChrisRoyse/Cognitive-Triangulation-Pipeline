@@ -35,8 +35,8 @@ class DirectoryAggregationWorker {
                     baseConcurrency: this.managedWorker.config.baseConcurrency
                 });
                 
-                // Initialize the managed worker
-                this.initializeWorker();
+                // Don't initialize here - let it be initialized explicitly
+                console.log('ManagedWorker created, awaiting initialization');
             } else {
                 // Fallback to basic worker if no WorkerPoolManager
                 this.worker = new Worker('directory-aggregation-queue', this.process.bind(this), {
@@ -56,7 +56,10 @@ class DirectoryAggregationWorker {
             
             // Setup event handlers
             this.managedWorker.on('jobCompleted', (event) => {
-                this.logger.logQueueEvent('completed', 'directory-aggregation-queue', event.jobId, {
+                this.logger.info('Job completed', {
+                    eventType: 'queue-event',
+                    queueName: 'directory-aggregation-queue',
+                    jobId: event.jobId,
                     processingTime: event.processingTime
                 });
             });
@@ -69,7 +72,10 @@ class DirectoryAggregationWorker {
             });
             
             this.managedWorker.on('concurrencyChanged', (event) => {
-                this.logger.logWorkerPoolEvent('concurrency-changed', 'directory-aggregation', event.newConcurrency, {
+                this.logger.info('Worker pool concurrency changed', {
+                    eventType: 'worker-pool-event',
+                    workerType: 'directory-aggregation',
+                    newConcurrency: event.newConcurrency,
                     oldConcurrency: event.oldConcurrency,
                     reason: event.reason
                 });

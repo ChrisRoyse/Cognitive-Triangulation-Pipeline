@@ -25,6 +25,7 @@ class FileAnalysisWorker {
         this.config = options.pipelineConfig || PipelineConfig.createDefault();
         const workerLimit = this.config.getWorkerLimit('file-analysis');
         const apiRateLimit = this.config.performance.apiRateLimit;
+        const highPerformanceMode = process.env.HIGH_PERFORMANCE_MODE === 'true';
         
         // Initialize logger
         this.logger = getLogger('FileAnalysisWorker');
@@ -37,7 +38,7 @@ class FileAnalysisWorker {
                     baseConcurrency: Math.min(5, workerLimit), // Conservative starting point
                     maxConcurrency: workerLimit, // Use centralized limit
                     minConcurrency: 1,
-                    rateLimitRequests: Math.floor(apiRateLimit / 2), // Reserve half for file analysis
+                    rateLimitRequests: highPerformanceMode ? 100 : Math.floor(apiRateLimit / 2), // Higher in high perf mode
                     rateLimitWindow: 1000,
                     failureThreshold: 3,
                     resetTimeout: 90000,
@@ -53,8 +54,8 @@ class FileAnalysisWorker {
                     baseConcurrency: this.managedWorker.config.baseConcurrency
                 });
                 
-                // Initialize the managed worker
-                this.initializeWorker();
+                // Don't initialize here - let it be initialized explicitly
+                this.logger.info('ManagedWorker created, awaiting initialization');
             } else {
                 // Fallback to basic worker with centralized concurrency
                 this.worker = new Worker('file-analysis-queue', this.process.bind(this), {

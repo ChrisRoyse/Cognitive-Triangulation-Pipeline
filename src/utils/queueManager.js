@@ -32,6 +32,18 @@ class QueueManager {
     this.connection = new IORedis(config.REDIS_URL, {
       maxRetriesPerRequest: null,
       enableReadyCheck: true,
+      enableOfflineQueue: true,
+      reconnectOnError: (err) => {
+        const targetError = 'READONLY';
+        if (err.message.includes(targetError)) {
+          // Only reconnect when the error contains "READONLY"
+          return true;
+        }
+        return false;
+      },
+      // Connection pool settings for high concurrency
+      connectionName: 'queue-manager',
+      lazyConnect: false,
     });
 
     this.connection.on('connect', () => {
@@ -61,6 +73,17 @@ class QueueManager {
     return new Promise((resolve, reject) => {
       this.connection.once('ready', resolve);
       this.connection.once('error', reject);
+    });
+  }
+
+  createConnection(name = 'worker') {
+    // Create a new Redis connection for workers to avoid connection conflicts
+    return new IORedis(config.REDIS_URL, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      enableOfflineQueue: true,
+      connectionName: name,
+      lazyConnect: false,
     });
   }
 

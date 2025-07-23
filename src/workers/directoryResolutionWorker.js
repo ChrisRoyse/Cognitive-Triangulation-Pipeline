@@ -31,8 +31,8 @@ class DirectoryResolutionWorker {
                     ...options
                 });
                 
-                // Initialize the managed worker
-                this.initializeWorker();
+                // Don't initialize here - let it be initialized explicitly
+                console.log('ManagedWorker created, awaiting initialization');
             } else {
                 // Fallback to basic worker if no WorkerPoolManager
                 this.worker = new Worker('directory-resolution-queue', this.process.bind(this), {

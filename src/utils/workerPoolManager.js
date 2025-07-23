@@ -21,8 +21,9 @@ class WorkerPoolManager extends EventEmitter {
         // Set environment first
         const environment = options.environment || process.env.NODE_ENV || 'development';
         
-        // HARD LIMIT: 100 total concurrent LLM API calls across ALL workers
-        const ABSOLUTE_MAX_CONCURRENCY = 100;
+        // HARD LIMIT: Support high concurrency when forced
+        const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
+        const ABSOLUTE_MAX_CONCURRENCY = forcedConcurrency > 0 ? forcedConcurrency * 5 : 100; // Allow 5x forced concurrency for all worker types
         
         // Get high performance mode flag early
         const highPerformanceMode = process.env.HIGH_PERFORMANCE_MODE === 'true';
@@ -55,11 +56,13 @@ class WorkerPoolManager extends EventEmitter {
             
             // Rate limiting (per worker type) - More permissive for better throughput
             rateLimits: {
-                default: { requests: highPerformanceMode ? 30 : 15, window: 1000 }, // Double in high perf mode
-                'file-analysis': { requests: highPerformanceMode ? 25 : 12, window: 1000 }, // Increased for 150 agents
-                'llm-analysis': { requests: highPerformanceMode ? 20 : 8, window: 1000 }, // Increased but still respect API
-                'validation': { requests: highPerformanceMode ? 40 : 20, window: 1000 }, // Can handle more
-                'graph-ingestion': { requests: highPerformanceMode ? 30 : 15, window: 1000 },
+                default: { requests: highPerformanceMode ? 100 : 15, window: 1000 }, // Much higher in high perf mode
+                'file-analysis': { requests: highPerformanceMode ? 100 : 12, window: 1000 }, // High for parallel processing
+                'llm-analysis': { requests: highPerformanceMode ? 50 : 8, window: 1000 }, // Still respect API limits
+                'validation': { requests: highPerformanceMode ? 200 : 20, window: 1000 }, // Can handle more
+                'graph-ingestion': { requests: highPerformanceMode ? 100 : 15, window: 1000 },
+                'relationship-resolution': { requests: highPerformanceMode ? 80 : 10, window: 1000 },
+                'directory-aggregation': { requests: highPerformanceMode ? 150 : 20, window: 1000 },
                 ...options.rateLimits
             },
             
@@ -161,7 +164,18 @@ class WorkerPoolManager extends EventEmitter {
      */
     registerWorker(workerType, options = {}) {
         const priority = this.config.workerPriorities[workerType] || 5;
-        const initialConcurrency = this.calculateInitialConcurrency(workerType, priority);
+        
+        // Check for forced concurrency override
+        let initialConcurrency;
+        const forcedConcurrency = process.env.FORCE_MAX_CONCURRENCY;
+        if (forcedConcurrency && parseInt(forcedConcurrency) > 0) {
+            // When using forced concurrency, respect the worker limits from PipelineConfig
+            // which distributes the total across worker types
+            initialConcurrency = options.maxConcurrency || this.calculateInitialConcurrency(workerType, priority);
+            console.log(`🎯 Worker '${workerType}' concurrency: ${initialConcurrency}`);
+        } else {
+            initialConcurrency = this.calculateInitialConcurrency(workerType, priority);
+        }
         
         const workerInfo = {
             type: workerType,
@@ -263,7 +277,7 @@ class WorkerPoolManager extends EventEmitter {
         if (worker.activeJobs >= worker.concurrency) {
             this.metrics.throttledRequests++;
             console.warn(`⚠️  Worker '${workerType}' concurrency limit reached: ${worker.activeJobs}/${worker.concurrency}`);
-            throw new Error(`Worker '${workerType}' concurrency limit reached`);
+            throw new Error(`Worker '${workerType}' concurrency limit reached: ${worker.activeJobs}/${worker.concurrency}`);
         }
         
         // Check rate limiting with more permissive logic

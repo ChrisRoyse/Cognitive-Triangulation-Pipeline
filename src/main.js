@@ -72,7 +72,7 @@ class CognitiveTriangulationPipeline {
             await this.initialize();
 
             console.log('🏁 [main.js] Starting workers and services...');
-            this.startWorkers();
+            await this.startWorkers();
             this.outboxPublisher.start();
 
             console.log('🔍 [main.js] Starting EntityScout to produce jobs...');
@@ -100,7 +100,7 @@ class CognitiveTriangulationPipeline {
         }
     }
 
-    startWorkers() {
+    async startWorkers() {
         console.log('🚀 [main.js] Starting managed workers with intelligent concurrency control...');
         
         try {
@@ -113,6 +113,12 @@ class CognitiveTriangulationPipeline {
                 this.workerPoolManager,
                 { pipelineConfig: this.pipelineConfig }
             );
+            
+            // Initialize the managed worker if it exists
+            if (fileAnalysisWorker.managedWorker) {
+                await fileAnalysisWorker.initializeWorker();
+            }
+            
             this.workers.push(fileAnalysisWorker);
             
             const directoryResolutionWorker = new DirectoryResolutionWorker(
@@ -122,6 +128,9 @@ class CognitiveTriangulationPipeline {
                 this.llmClient, 
                 this.workerPoolManager
             );
+            if (directoryResolutionWorker.managedWorker) {
+                await directoryResolutionWorker.initializeWorker();
+            }
             this.workers.push(directoryResolutionWorker);
             
             const directoryAggregationWorker = new DirectoryAggregationWorker(
@@ -129,6 +138,9 @@ class CognitiveTriangulationPipeline {
                 this.cacheClient, 
                 this.workerPoolManager
             );
+            if (directoryAggregationWorker.managedWorker) {
+                await directoryAggregationWorker.initializeWorker();
+            }
             this.workers.push(directoryAggregationWorker);
             
             const relationshipResolutionWorker = new RelationshipResolutionWorker(
@@ -137,6 +149,9 @@ class CognitiveTriangulationPipeline {
                 this.llmClient, 
                 this.workerPoolManager
             );
+            if (relationshipResolutionWorker.managedWorker) {
+                await relationshipResolutionWorker.initializeWorker();
+            }
             this.workers.push(relationshipResolutionWorker);
             
             const validationWorker = new ValidationWorker(
@@ -145,6 +160,9 @@ class CognitiveTriangulationPipeline {
                 this.cacheClient, 
                 this.workerPoolManager
             );
+            if (validationWorker.managedWorker) {
+                await validationWorker.initializeWorker();
+            }
             this.workers.push(validationWorker);
             
             const reconciliationWorker = new ReconciliationWorker(
@@ -152,6 +170,9 @@ class CognitiveTriangulationPipeline {
                 this.dbManager, 
                 this.workerPoolManager
             );
+            if (reconciliationWorker.managedWorker) {
+                await reconciliationWorker.initializeWorker();
+            }
             this.workers.push(reconciliationWorker);
             
             console.log('✅ All managed workers are running and listening for jobs.');

@@ -22,17 +22,39 @@ class PipelineConfig {
         this.TOTAL_WORKER_CONCURRENCY = 100;  // Worker-specific hard limit
         
         // ===== WORKER CONCURRENCY LIMITS =====
-        // Carefully calibrated to total exactly 100 workers
-        this.workerLimits = {
-            'file-analysis': 40,           // Most CPU intensive
-            'relationship-resolution': 30,  // Memory intensive + LLM calls
-            'directory-aggregation': 10,    // I/O intensive
-            'validation': 15,               // CPU + memory intensive
-            'graph-ingestion': 5           // Database + network intensive
-        };
+        // Check for forced override first
+        const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
+        if (forcedConcurrency > 0) {
+            console.log(`🎯 Distributing FORCE_MAX_CONCURRENCY=${forcedConcurrency} across worker types`);
+            // Distribute the total concurrency across worker types based on priority
+            this.workerLimits = {
+                'file-analysis': Math.floor(forcedConcurrency * 0.4),           // 40% for file analysis (most important)
+                'relationship-resolution': Math.floor(forcedConcurrency * 0.3),  // 30% for relationships
+                'directory-aggregation': Math.floor(forcedConcurrency * 0.1),    // 10% for directory
+                'validation': Math.floor(forcedConcurrency * 0.15),              // 15% for validation
+                'graph-ingestion': Math.floor(forcedConcurrency * 0.05)          // 5% for graph
+            };
+            
+            // Ensure at least 1 worker per type
+            Object.keys(this.workerLimits).forEach(key => {
+                if (this.workerLimits[key] < 1) this.workerLimits[key] = 1;
+            });
+        } else {
+            // Carefully calibrated to total exactly 100 workers
+            this.workerLimits = {
+                'file-analysis': parseInt(process.env.MAX_FILE_ANALYSIS_WORKERS) || 40,           // Most CPU intensive
+                'relationship-resolution': parseInt(process.env.MAX_RELATIONSHIP_WORKERS) || 30,  // Memory intensive + LLM calls
+                'directory-aggregation': parseInt(process.env.MAX_DIRECTORY_WORKERS) || 10,    // I/O intensive
+                'validation': parseInt(process.env.MAX_VALIDATION_WORKERS) || 15,               // CPU + memory intensive
+                'graph-ingestion': parseInt(process.env.MAX_GRAPH_WORKERS) || 5           // Database + network intensive
+            };
+        }
         
         // Validate that worker limits don't exceed total
-        this._validateWorkerLimits();
+        // Skip validation if using forced concurrency (all workers have same limit)
+        if (!forcedConcurrency || forcedConcurrency <= 0) {
+            this._validateWorkerLimits();
+        }
         
         // ===== PERFORMANCE THRESHOLDS =====
         this.performance = {
@@ -233,6 +255,14 @@ class PipelineConfig {
      */
     _validateWorkerLimits() {
         const totalWorkers = Object.values(this.workerLimits).reduce((sum, limit) => sum + limit, 0);
+        
+        // When using FORCE_MAX_CONCURRENCY, we're forcing all workers to have the same limit
+        // This is intentional for high-performance mode
+        const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
+        if (forcedConcurrency > 0) {
+            console.log(`✅ Using FORCE_MAX_CONCURRENCY=${forcedConcurrency} for all ${Object.keys(this.workerLimits).length} worker types (total: ${totalWorkers} workers)`);
+            return;
+        }
         
         if (totalWorkers > this.TOTAL_WORKER_CONCURRENCY) {
             throw new Error(

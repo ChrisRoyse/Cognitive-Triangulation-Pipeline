@@ -109,8 +109,24 @@ class ManagedWorker extends EventEmitter {
             });
             
             // Create BullMQ worker with managed concurrency
+            // Create a new connection to avoid "write after end" errors
+            const config = require('../../config');
+            const IORedis = require('ioredis');
+            const workerConnection = new IORedis(config.REDIS_URL, {
+                maxRetriesPerRequest: null,
+                enableReadyCheck: true,
+                connectionName: `worker-${this.workerType}-${this.config.workerId}`,
+                lazyConnect: true, // Don't connect immediately
+            });
+            
+            // Store connection for cleanup
+            this.workerConnection = workerConnection;
+            
+            // Ensure connection is ready before creating worker
+            await workerConnection.connect();
+            
             this.worker = new Worker(this.queueName, this.createManagedProcessor(processingFunction), {
-                connection,
+                connection: workerConnection,
                 concurrency: this.workerInfo.concurrency,
                 removeOnComplete: {
                     count: 100,
@@ -340,7 +356,10 @@ class ManagedWorker extends EventEmitter {
      */
     handleConcurrencyChange(newConcurrency, reason) {
         if (this.worker && this.worker.opts.concurrency !== newConcurrency) {
-            this.logger.logWorkerPoolEvent('concurrency-changed', this.workerType, newConcurrency, {
+            this.logger.info('Worker pool concurrency changed', {
+                eventType: 'worker-pool-event',
+                workerType: this.workerType,
+                newConcurrency,
                 oldConcurrency: this.worker.opts.concurrency,
                 reason
             });
@@ -530,6 +549,12 @@ class ManagedWorker extends EventEmitter {
             if (this.worker) {
                 await this.worker.close();
                 this.worker = null;
+            }
+            
+            // Close the dedicated worker connection
+            if (this.workerConnection) {
+                await this.workerConnection.disconnect();
+                this.workerConnection = null;
             }
             
             // Final metrics report

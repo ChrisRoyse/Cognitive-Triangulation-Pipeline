@@ -128,40 +128,28 @@ class GraphBuilder {
     async _runRelationshipBatch(batch) {
         const session = this.neo4jDriver.session({ database: this.dbName });
         try {
-            // Group batch by relationship type since we need different Cypher for each type
-            const batchesByType = {};
-            for (const item of batch) {
-                const relType = item.relationship.type;
-                if (!batchesByType[relType]) {
-                    batchesByType[relType] = [];
-                }
-                batchesByType[relType].push(item);
-            }
-            
-            // Process each relationship type separately
-            for (const [relType, typedBatch] of Object.entries(batchesByType)) {
-                const cypher = `
-                    UNWIND $batch as item
-                    MERGE (source:POI {id: item.source.id})
-                    ON CREATE SET source.type = item.source.type,
-                                  source.name = item.source.name,
-                                  source.filePath = item.source.file_path,
-                                  source.startLine = item.source.start_line,
-                                  source.endLine = item.source.end_line
-                    MERGE (target:POI {id: item.target.id})
-                    ON CREATE SET target.type = item.target.type,
-                                  target.name = item.target.name,
-                                  target.filePath = item.target.file_path,
-                                  target.startLine = item.target.start_line,
-                                  target.endLine = item.target.end_line
-                    MERGE (source)-[r:${relType}]->(target)
-                    ON CREATE SET r.type = $relType,
-                                  r.confidence = item.relationship.confidence,
-                                  r.filePath = item.source.file_path
-                    ON MATCH SET r.confidence = item.relationship.confidence
-                `;
-                await session.run(cypher, { batch: typedBatch, relType });
-            }
+            const cypher = `
+                UNWIND $batch as item
+                MERGE (source:POI {id: item.source.id})
+                ON CREATE SET source.type = item.source.type,
+                              source.name = item.source.name,
+                              source.filePath = item.source.file_path,
+                              source.startLine = item.source.start_line,
+                              source.endLine = item.source.end_line
+                MERGE (target:POI {id: item.target.id})
+                ON CREATE SET target.type = item.target.type,
+                              target.name = item.target.name,
+                              target.filePath = item.target.file_path,
+                              target.startLine = item.target.start_line,
+                              target.endLine = item.target.end_line
+                MERGE (source)-[r:RELATIONSHIP]->(target)
+                ON CREATE SET r.type = item.relationship.type,
+                              r.confidence = item.relationship.confidence,
+                              r.filePath = item.source.file_path
+                ON MATCH SET r.type = item.relationship.type,
+                             r.confidence = item.relationship.confidence
+            `;
+            await session.run(cypher, { batch });
         } catch (error) {
             console.error(`[GraphBuilder] Error processing relationship batch:`, error);
             throw error;
