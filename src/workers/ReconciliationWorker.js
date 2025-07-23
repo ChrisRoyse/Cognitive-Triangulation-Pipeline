@@ -75,21 +75,37 @@ class ReconciliationWorker {
         // 2. Calculate confidence score
         const { finalScore, hasConflict } = ConfidenceScoringService.calculateFinalScore(evidence);
 
-        // 3. Write final relationship
+        // 3. Update existing relationship status to VALIDATED
         if (finalScore > 0.5) { // Confidence threshold
-            const finalRelationship = evidence[0]; // Assuming the base relationship data is in the first evidence
-            db.prepare(
-                `INSERT INTO relationships (from_node_id, to_node_id, type, resolution_level)
-                 VALUES (?, ?, ?, ?)`
-            ).run(
-                finalRelationship.from,
-                finalRelationship.to,
-                finalRelationship.type,
-                'file'
-            );
-            console.log(`[ReconciliationWorker] Validated relationship ${relationshipHash} with score ${finalScore}`);
+            // Update existing relationships to VALIDATED status
+            const updateResult = db.prepare(
+                `UPDATE relationships 
+                 SET status = 'VALIDATED', confidence_score = ?
+                 WHERE id IN (
+                     SELECT DISTINCT re.relationship_id 
+                     FROM relationship_evidence re 
+                     WHERE re.relationship_hash = ?
+                 )`
+            ).run(finalScore, relationshipHash);
+            
+            if (updateResult.changes > 0) {
+                console.log(`[ReconciliationWorker] Validated ${updateResult.changes} relationship(s) ${relationshipHash} with score ${finalScore}`);
+            } else {
+                console.log(`[ReconciliationWorker] No relationships found to validate for hash ${relationshipHash}`);
+            }
         } else {
-            console.log(`[ReconciliationWorker] Discarded relationship ${relationshipHash} with score ${finalScore}`);
+            // Mark relationships as DISCARDED for low confidence
+            const discardResult = db.prepare(
+                `UPDATE relationships 
+                 SET status = 'DISCARDED', confidence_score = ?
+                 WHERE id IN (
+                     SELECT DISTINCT re.relationship_id 
+                     FROM relationship_evidence re 
+                     WHERE re.relationship_hash = ?
+                 )`
+            ).run(finalScore, relationshipHash);
+            
+            console.log(`[ReconciliationWorker] Discarded ${discardResult.changes} relationship(s) ${relationshipHash} with score ${finalScore}`);
         }
     }
 }

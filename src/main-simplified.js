@@ -324,8 +324,10 @@ class SimplifiedCognitiveTriangulationPipeline {
                     // Check if we've exceeded max wait time
                     if (Date.now() - startTime > maxWaitTime) {
                         console.error('❌ [Queue Monitor] Maximum wait time exceeded. Forcing completion.');
+                        const counts = await this.queueManager.getJobCounts();
+                        console.error(`Final stats - Completed: ${counts.completed}, Failed: ${counts.failed}, Still Active: ${counts.active + counts.waiting + counts.delayed}`);
                         clearInterval(intervalId);
-                        reject(new Error('Pipeline timeout - maximum wait time exceeded'));
+                        resolve(); // Force completion rather than reject to allow GraphBuilder to run
                         return;
                     }
                     
@@ -339,13 +341,25 @@ class SimplifiedCognitiveTriangulationPipeline {
                     
                     const counts = await this.queueManager.getJobCounts();
                     const totalActive = counts.active + counts.waiting + counts.delayed;
+                    const totalProcessed = counts.completed + counts.failed;
+                    const failureRate = totalProcessed > 0 ? counts.failed / totalProcessed : 0;
                     
-                    console.log(`[Queue Monitor] Active: ${counts.active}, Waiting: ${counts.waiting}, Completed: ${counts.completed}, Failed: ${counts.failed}`);
+                    console.log(`[Queue Monitor] Active: ${counts.active}, Waiting: ${counts.waiting}, Completed: ${counts.completed}, Failed: ${counts.failed}, Failure Rate: ${(failureRate * 100).toFixed(1)}%`);
+
+                    // Check for excessive failure rate (allow up to 50% failure)
+                    if (totalProcessed > 10 && failureRate > 0.5) {
+                        console.error(`❌ [Queue Monitor] Excessive failure rate (${(failureRate * 100).toFixed(1)}%). Forcing completion.`);
+                        console.error(`Final stats - Completed: ${counts.completed}, Failed: ${counts.failed}, Still Active: ${totalActive}`);
+                        clearInterval(intervalId);
+                        resolve(); // Force completion to allow partial results processing
+                        return;
+                    }
 
                     if (totalActive === 0) {
                         idleChecks++;
                         console.log(`[Queue Monitor] Queues appear idle. Check ${idleChecks}/${requiredIdleChecks}.`);
                         if (idleChecks >= requiredIdleChecks) {
+                            console.log(`✅ [Queue Monitor] Pipeline completion - Completed: ${counts.completed}, Failed: ${counts.failed}`);
                             clearInterval(intervalId);
                             resolve();
                         }

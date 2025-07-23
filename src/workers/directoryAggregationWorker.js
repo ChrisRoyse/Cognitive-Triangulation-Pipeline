@@ -31,8 +31,8 @@ class DirectoryAggregationWorker {
                 });
                 
                 this.logger.info('DirectoryAggregationWorker configured', {
-                    maxConcurrency: this.managedWorker.options.maxConcurrency,
-                    baseConcurrency: this.managedWorker.options.baseConcurrency
+                    maxConcurrency: this.managedWorker.config.maxConcurrency,
+                    baseConcurrency: this.managedWorker.config.baseConcurrency
                 });
                 
                 // Initialize the managed worker
@@ -95,7 +95,11 @@ class DirectoryAggregationWorker {
         
         // Create child logger with correlation ID
         const jobLogger = this.logger.child(job.id);
-        const timer = jobLogger.startTimer('directory-aggregation', job.id);
+        
+        // Create performance logger for this job
+        const { createPerformanceLogger } = require('../config/logging');
+        const perfLogger = createPerformanceLogger(`directory-aggregation-${job.id}`, jobLogger);
+        perfLogger.start();
         
         jobLogger.info('Processing directory aggregation job', {
             directoryPath,
@@ -109,13 +113,13 @@ class DirectoryAggregationWorker {
             const processedFilesKey = `run:${runId}:dir:${directoryPath}:processed`;
 
             // Atomically mark the file as processed and check if all files are done
-            const cacheTimer = jobLogger.startTimer('cache-operations', job.id);
+            const cacheStart = Date.now();
             const pipeline = this.cacheClient.pipeline();
             pipeline.sadd(processedFilesKey, fileJobId);
             pipeline.scard(directoryFilesKey);
             pipeline.scard(processedFilesKey);
             const [, totalFiles, processedFiles] = await pipeline.exec();
-            cacheTimer.end('Cache operations completed');
+            perfLogger.checkpoint('cache-operations', { duration: Date.now() - cacheStart });
 
             jobLogger.info('Directory aggregation progress', {
                 directoryPath,
@@ -142,20 +146,22 @@ class DirectoryAggregationWorker {
                 });
             }
             
-            const metrics = timer.end('Directory aggregation completed');
+            const metrics = perfLogger.end({
+                totalFiles: totalFiles[1],
+                processedFiles: processedFiles[1],
+                allFilesProcessed: totalFiles[1] === processedFiles[1]
+            });
             
             // Log performance metrics
-            jobLogger.logMetrics({
-                directoryAggregation: {
-                    duration: metrics.duration,
-                    memoryUsage: metrics.memoryUsage,
-                    totalFiles: totalFiles[1],
-                    processedFiles: processedFiles[1]
-                }
+            jobLogger.info('Directory aggregation metrics', {
+                duration: metrics.duration,
+                memoryDelta: metrics.memoryDelta,
+                totalFiles: totalFiles[1],
+                processedFiles: processedFiles[1]
             });
             
         } catch (error) {
-            timer.end('Directory aggregation failed');
+            perfLogger.end({ success: false, error: error.message });
             jobLogger.error('Error processing directory aggregation job', error, {
                 directoryPath,
                 runId,

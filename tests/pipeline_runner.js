@@ -28,7 +28,7 @@ class PipelineRunner {
             sqliteDbPath: options.sqliteDbPath || './cognitive_graph.db',
             neo4jUri: options.neo4jUri || 'bolt://localhost:7687',
             neo4jUsername: options.neo4jUsername || 'neo4j',
-            neo4jPassword: options.neo4jPassword || process.env.NEO4J_PASSWORD || 'CTPSecure2024!',
+            neo4jPassword: options.neo4jPassword || process.env.NEO4J_PASSWORD || 'test1234',
             outputDir: options.outputDir || './test-results',
             timeout: options.timeout || 300000, // 5 minutes
             verbose: options.verbose || false,

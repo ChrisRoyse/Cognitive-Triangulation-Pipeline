@@ -40,7 +40,7 @@ class CognitiveTriangulationPipeline {
             memoryThreshold: this.pipelineConfig.performance.memoryThreshold
         });
         
-        this.outboxPublisher = new TransactionalOutboxPublisher(this.dbManager, this.queueManager);
+        this.outboxPublisher = null; // Will be initialized after database setup
         this.workers = []; // Track workers for cleanup
         this.metrics = {
             startTime: null,
@@ -55,6 +55,10 @@ class CognitiveTriangulationPipeline {
         // Initialize database schema with migrations
         await this.dbManager.initializeDb();
         console.log('🚀 [main.js] Database schema initialized with migrations.');
+        
+        // Initialize outbox publisher after database is ready
+        this.outboxPublisher = new TransactionalOutboxPublisher(this.dbManager, this.queueManager);
+        console.log('🚀 [main.js] TransactionalOutboxPublisher initialized.');
         
         await this.queueManager.connect();
         await this.clearDatabases();
@@ -202,6 +206,9 @@ class CognitiveTriangulationPipeline {
     async waitForCompletion() {
         return new Promise((resolve, reject) => {
             const checkInterval = 5000; // Check every 5 seconds
+            const maxWaitTime = 10 * 60 * 1000; // 10 minutes maximum wait time
+            const maxFailureRate = 0.5; // Allow up to 50% job failure rate
+            const startTime = Date.now();
             let idleChecks = 0;
             const requiredIdleChecks = 3; // Require 3 consecutive idle checks to be sure
 
@@ -209,13 +216,34 @@ class CognitiveTriangulationPipeline {
                 try {
                     const counts = await this.queueManager.getJobCounts();
                     const totalActive = counts.active + counts.waiting + counts.delayed;
+                    const totalProcessed = counts.completed + counts.failed;
+                    const failureRate = totalProcessed > 0 ? counts.failed / totalProcessed : 0;
                     
-                    console.log(`[Queue Monitor] Active: ${counts.active}, Waiting: ${counts.waiting}, Completed: ${counts.completed}, Failed: ${counts.failed}`);
+                    console.log(`[Queue Monitor] Active: ${counts.active}, Waiting: ${counts.waiting}, Completed: ${counts.completed}, Failed: ${counts.failed}, Failure Rate: ${(failureRate * 100).toFixed(1)}%`);
+
+                    // Check for timeout
+                    if (Date.now() - startTime > maxWaitTime) {
+                        console.error('❌ [Queue Monitor] Maximum wait time exceeded. Forcing completion.');
+                        console.error(`Final stats - Completed: ${counts.completed}, Failed: ${counts.failed}, Still Active: ${totalActive}`);
+                        clearInterval(intervalId);
+                        resolve(); // Force completion rather than reject to allow GraphBuilder to run
+                        return;
+                    }
+
+                    // Check for excessive failure rate
+                    if (totalProcessed > 10 && failureRate > maxFailureRate) {
+                        console.error(`❌ [Queue Monitor] Excessive failure rate (${(failureRate * 100).toFixed(1)}%). Forcing completion.`);
+                        console.error(`Final stats - Completed: ${counts.completed}, Failed: ${counts.failed}, Still Active: ${totalActive}`);
+                        clearInterval(intervalId);
+                        resolve(); // Force completion to allow partial results processing
+                        return;
+                    }
 
                     if (totalActive === 0) {
                         idleChecks++;
                         console.log(`[Queue Monitor] Queues appear idle. Check ${idleChecks}/${requiredIdleChecks}.`);
                         if (idleChecks >= requiredIdleChecks) {
+                            console.log(`✅ [Queue Monitor] Pipeline completion - Completed: ${counts.completed}, Failed: ${counts.failed}`);
                             clearInterval(intervalId);
                             resolve();
                         }
@@ -223,6 +251,7 @@ class CognitiveTriangulationPipeline {
                         idleChecks = 0; // Reset if we see activity
                     }
                 } catch (error) {
+                    console.error('[Queue Monitor] Error checking job counts:', error);
                     clearInterval(intervalId);
                     reject(error);
                 }

@@ -72,8 +72,8 @@ class BatchedDatabaseWriter extends EventEmitter {
                 
                 // POI operations
                 insertPoi: this.db.prepare(`
-                    INSERT OR IGNORE INTO pois (file_path, name, type, start_line, end_line, llm_output, hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO pois (file_path, name, type, start_line, end_line, llm_output, hash, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 `),
                 
                 // Relationship operations
@@ -305,7 +305,7 @@ class BatchedDatabaseWriter extends EventEmitter {
                 for (const poi of items) {
                     this.statements.insertPoi.run(
                         poi.filePath, poi.name, poi.type, poi.startLine, 
-                        poi.endLine, poi.llmOutput, poi.hash
+                        poi.endLine, poi.llmOutput, poi.hash, poi.runId
                     );
                 }
                 break;

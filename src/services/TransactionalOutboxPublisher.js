@@ -68,33 +68,43 @@ class TransactionalOutboxPublisher {
 
         console.log(`[TransactionalOutboxPublisher] Found ${events.length} pending events.`);
 
+        const poiEvents = events.filter(e => e.event_type === 'file-analysis-finding');
         const relationshipEvents = events.filter(e => e.event_type === 'relationship-analysis-finding');
-        const otherEvents = events.filter(e => e.event_type !== 'relationship-analysis-finding');
+        const otherEvents = events.filter(e => e.event_type !== 'file-analysis-finding' && e.event_type !== 'relationship-analysis-finding');
 
+        // Process POI events FIRST to populate the database
+        const statusUpdates = [];
+        
+        for (const event of poiEvents) {
+            try {
+                await this._handleFileAnalysisFinding(event);
+                statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
+            } catch (error) {
+                console.error(`[TransactionalOutboxPublisher] Failed to publish POI event ${event.id}:`, error);
+                statusUpdates.push({ id: event.id, status: 'FAILED' });
+            }
+        }
+        
+        // Force flush POI inserts before processing relationships
+        await this.batchWriter.flush();
+        
+        // Process relationship events AFTER POIs are in database
         if (relationshipEvents.length > 0) {
             await this._handleBatchedRelationshipFindings(relationshipEvents);
         }
-
-        // Process other events and batch the status updates
-        const statusUpdates = [];
         
+        // Process any other events
         for (const event of otherEvents) {
             try {
-                if (event.event_type === 'file-analysis-finding') {
-                    await this._handleFileAnalysisFinding(event);
+                const queueName = this.getQueueForEvent(event.event_type);
+                if (queueName) {
+                    const queue = this.queueManager.getQueue(queueName);
+                    const payload = JSON.parse(event.payload);
+                    await queue.add(payload.type, payload);
+                    console.log(`[TransactionalOutboxPublisher] Published event ${event.id} to queue ${queueName}`);
                 } else {
-                    const queueName = this.getQueueForEvent(event.event_type);
-                    if (queueName) {
-                        const queue = this.queueManager.getQueue(queueName);
-                        const payload = JSON.parse(event.payload);
-                        await queue.add(payload.type, payload);
-                        console.log(`[TransactionalOutboxPublisher] Published event ${event.id} to queue ${queueName}`);
-                    } else {
-                        console.log(`[TransactionalOutboxPublisher] No downstream queue for event type ${event.event_type}, marking as processed.`);
-                    }
+                    console.log(`[TransactionalOutboxPublisher] No downstream queue for event type ${event.event_type}, marking as processed.`);
                 }
-
-                // Add to batch instead of immediate update
                 statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
             } catch (error) {
                 console.error(`[TransactionalOutboxPublisher] Failed to publish event ${event.id}:`, error);
@@ -112,10 +122,34 @@ class TransactionalOutboxPublisher {
     async _handleFileAnalysisFinding(event) {
         const payload = JSON.parse(event.payload);
         const { pois, filePath, runId } = payload;
-        const queue = this.queueManager.getQueue('relationship-resolution-queue');
 
         if (pois && pois.length > 0) {
-            console.log(`[TransactionalOutboxPublisher] Fanning out ${pois.length} POI jobs for file ${filePath}`);
+            console.log(`[TransactionalOutboxPublisher] Writing ${pois.length} POIs to database for file ${filePath}`);
+            
+            // Write POIs directly to database using batch writer
+            for (const poi of pois) {
+                // Generate a unique hash for each POI
+                const hash = crypto.createHash('md5');
+                hash.update(filePath);
+                hash.update(poi.name);
+                hash.update(poi.type);
+                hash.update(String(poi.startLine || poi.start_line || 0));
+                const poiHash = hash.digest('hex');
+                
+                this.batchWriter.addPoiInsert({
+                    filePath: filePath,
+                    name: poi.name,
+                    type: poi.type,
+                    startLine: poi.startLine || poi.start_line,
+                    endLine: poi.endLine || poi.end_line,
+                    llmOutput: JSON.stringify(poi),
+                    hash: poiHash,
+                    runId: runId
+                });
+            }
+            
+            // Also create relationship resolution jobs (keep existing queue logic)
+            const queue = this.queueManager.getQueue('relationship-resolution-queue');
             for (const primaryPoi of pois) {
                 const jobPayload = {
                     type: 'relationship-analysis-poi',
@@ -146,7 +180,39 @@ class TransactionalOutboxPublisher {
         }
 
         if (allRelationships.length > 0) {
-            console.log(`[TransactionalOutboxPublisher] Creating super-batch of ${allRelationships.length} relationship findings for validation.`);
+            console.log(`[TransactionalOutboxPublisher] Writing ${allRelationships.length} relationships to database and creating validation batch.`);
+            
+            // Write relationships directly to database using batch writer
+            // Resolve POI names to actual POI IDs from the database
+            const db = this.dbManager.getDb();
+            
+            for (const relationship of allRelationships) {
+                try {
+                    // Find source POI ID
+                    const sourcePoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.from, runId);
+                    const targetPoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.to, runId);
+                    
+                    if (sourcePoi && targetPoi) {
+                        // Insert relationship with POI IDs
+                        this.batchWriter.addRelationshipInsert({
+                            sourcePoiId: sourcePoi.id,
+                            targetPoiId: targetPoi.id,
+                            type: relationship.type,
+                            filePath: relationship.filePath || relationship.file_path,
+                            status: 'PENDING', // Will be updated to VALIDATED by ReconciliationWorker
+                            confidenceScore: relationship.confidence || 0.8
+                        });
+                        
+                        console.log(`[TransactionalOutboxPublisher] Queued relationship ${relationship.from} -> ${relationship.to} (IDs: ${sourcePoi.id} -> ${targetPoi.id})`);
+                    } else {
+                        console.warn(`[TransactionalOutboxPublisher] Could not resolve POI IDs for relationship ${relationship.from} -> ${relationship.to}`);
+                        if (!sourcePoi) console.warn(`  Source POI '${relationship.from}' not found`);
+                        if (!targetPoi) console.warn(`  Target POI '${relationship.to}' not found`);
+                    }
+                } catch (error) {
+                    console.error(`[TransactionalOutboxPublisher] Error processing relationship ${relationship.from} -> ${relationship.to}:`, error.message);
+                }
+            }
             
             const batchedPayload = allRelationships.map(relationship => {
                 const hash = crypto.createHash('md5');

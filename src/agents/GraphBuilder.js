@@ -8,7 +8,7 @@ class GraphBuilder {
         this.dbName = dbName;
         this.config = {
             batchSize: 500,
-            maxConcurrentBatches: 2,
+            maxConcurrentBatches: 1, // Avoid deadlocks by processing batches sequentially
         };
     }
 
@@ -61,9 +61,9 @@ class GraphBuilder {
         const activePromises = new Set();
         let processedCount = 0;
 
-        const generateSemanticId = (poi, filePath, startLine) => {
-            if (poi.type === 'file') return filePath;
-            return `${poi.type}:${poi.name}@${filePath}:${startLine}`;
+        const generateSemanticId = (poi, filePath) => {
+            // Schema specifies: Composite key format: {filePath}:{name}
+            return `${filePath}:${poi.name}`;
         };
 
         const processBatch = async (batch) => {
@@ -83,7 +83,7 @@ class GraphBuilder {
 
         for (const row of relIterator) {
             const sourceNode = {
-                id: generateSemanticId({ type: row.source_type, name: row.source_name }, row.source_file_path, row.source_start_line),
+                id: generateSemanticId({ type: row.source_type, name: row.source_name }, row.source_file_path),
                 file_path: row.source_file_path,
                 name: row.source_name,
                 type: row.source_type,
@@ -91,7 +91,7 @@ class GraphBuilder {
                 end_line: row.source_end_line,
             };
             const targetNode = {
-                id: generateSemanticId({ type: row.target_type, name: row.target_name }, row.target_file_path, row.target_start_line),
+                id: generateSemanticId({ type: row.target_type, name: row.target_name }, row.target_file_path),
                 file_path: row.target_file_path,
                 name: row.target_name,
                 type: row.target_type,
@@ -128,17 +128,40 @@ class GraphBuilder {
     async _runRelationshipBatch(batch) {
         const session = this.neo4jDriver.session({ database: this.dbName });
         try {
-            const cypher = `
-                UNWIND $batch as item
-                MERGE (source:POI {id: item.source.id})
-                ON CREATE SET source += item.source
-                MERGE (target:POI {id: item.target.id})
-                ON CREATE SET target += item.target
-                MERGE (source)-[r:RELATIONSHIP {type: item.relationship.type}]->(target)
-                ON CREATE SET r.confidence = item.relationship.confidence
-                ON MATCH SET r.confidence = item.relationship.confidence
-            `;
-            await session.run(cypher, { batch });
+            // Group batch by relationship type since we need different Cypher for each type
+            const batchesByType = {};
+            for (const item of batch) {
+                const relType = item.relationship.type;
+                if (!batchesByType[relType]) {
+                    batchesByType[relType] = [];
+                }
+                batchesByType[relType].push(item);
+            }
+            
+            // Process each relationship type separately
+            for (const [relType, typedBatch] of Object.entries(batchesByType)) {
+                const cypher = `
+                    UNWIND $batch as item
+                    MERGE (source:POI {id: item.source.id})
+                    ON CREATE SET source.type = item.source.type,
+                                  source.name = item.source.name,
+                                  source.filePath = item.source.file_path,
+                                  source.startLine = item.source.start_line,
+                                  source.endLine = item.source.end_line
+                    MERGE (target:POI {id: item.target.id})
+                    ON CREATE SET target.type = item.target.type,
+                                  target.name = item.target.name,
+                                  target.filePath = item.target.file_path,
+                                  target.startLine = item.target.start_line,
+                                  target.endLine = item.target.end_line
+                    MERGE (source)-[r:${relType}]->(target)
+                    ON CREATE SET r.type = $relType,
+                                  r.confidence = item.relationship.confidence,
+                                  r.filePath = item.source.file_path
+                    ON MATCH SET r.confidence = item.relationship.confidence
+                `;
+                await session.run(cypher, { batch: typedBatch, relType });
+            }
         } catch (error) {
             console.error(`[GraphBuilder] Error processing relationship batch:`, error);
             throw error;

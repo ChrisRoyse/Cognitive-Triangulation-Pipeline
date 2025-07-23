@@ -136,7 +136,7 @@ class QueueCleanupManager extends EventEmitter {
             await this._validateConnection();
             
             this.isRunning = true;
-            this._schedulePeriodicCleanup();
+            this.schedulePeriodicCleanup();
             this._scheduleHealthChecks();
             
             console.log('✅ QueueCleanupManager started successfully');
