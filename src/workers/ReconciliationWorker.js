@@ -1,14 +1,63 @@
 const { Worker } = require('bullmq');
 const ConfidenceScoringService = require('../services/cognitive_triangulation/ConfidenceScoringService');
+const { ManagedWorker } = require('./ManagedWorker');
 
 class ReconciliationWorker {
-    constructor(queueManager, dbManager) {
+    constructor(queueManager, dbManager, workerPoolManager, options = {}) {
         this.queueManager = queueManager;
         this.dbManager = dbManager;
-        this.worker = new Worker('reconciliation-queue', this.process.bind(this), {
-            connection: this.queueManager.connection,
-            concurrency: 5
-        });
+        this.workerPoolManager = workerPoolManager;
+        
+        if (!options.processOnly) {
+            if (workerPoolManager) {
+                // Create managed worker with intelligent concurrency control
+                this.managedWorker = new ManagedWorker('reconciliation-queue', workerPoolManager, {
+                    workerType: 'reconciliation',
+                    baseConcurrency: 8, // Good concurrency for reconciliation
+                    maxConcurrency: 25,
+                    minConcurrency: 2,
+                    rateLimitRequests: 20, // Higher rate for reconciliation processing
+                    rateLimitWindow: 1000,
+                    failureThreshold: 5,
+                    resetTimeout: 60000,
+                    jobTimeout: 180000, // 3 minutes for reconciliation
+                    retryAttempts: 3,
+                    retryDelay: 8000,
+                    ...options
+                });
+                
+                // Initialize the managed worker
+                this.initializeWorker();
+            } else {
+                // Fallback to basic worker if no WorkerPoolManager
+                this.worker = new Worker('reconciliation-queue', this.process.bind(this), {
+                    connection: this.queueManager.connection,
+                    concurrency: 5
+                });
+            }
+        }
+    }
+
+    async initializeWorker() {
+        try {
+            await this.managedWorker.initialize(
+                this.queueManager.connection,
+                this.process.bind(this)
+            );
+            
+            console.log('✅ ReconciliationWorker initialized with managed concurrency');
+        } catch (error) {
+            console.error('❌ Failed to initialize ReconciliationWorker:', error);
+            throw error;
+        }
+    }
+
+    async close() {
+        if (this.managedWorker) {
+            await this.managedWorker.shutdown();
+        } else if (this.worker) {
+            await this.worker.close();
+        }
     }
 
     async process(job) {

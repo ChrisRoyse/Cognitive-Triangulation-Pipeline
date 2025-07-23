@@ -1,0 +1,114 @@
+services:
+  # Main Application
+  ctp-app:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: ctp-app
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - NEO4J_URI=bolt://host.docker.internal:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-ChangeMeInProduction}
+      - NEO4J_DATABASE=ctp
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SQLITE_DB_PATH=/app/data/database.db
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - MAX_WORKERS=${MAX_WORKERS:-10}
+      - BATCH_SIZE=${BATCH_SIZE:-50}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # Mount source directory for analysis (can be overridden)
+      - ${SOURCE_DIR:-./polyglot-test}:/app/source:ro
+    ports:
+      - "${APP_PORT:-3002}:3002"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ctp-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+
+  # Redis for Queue Management
+  redis:
+    image: redis:7-alpine
+    container_name: ctp-redis
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory 512mb 
+      --maxmemory-policy noeviction
+      --save 60 1000
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    restart: unless-stopped
+    networks:
+      - ctp-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+
+  # Redis Admin UI (Optional - only in debug profile)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: ctp-redis-admin
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+      - HTTP_USER=${REDIS_ADMIN_USER:-admin}
+      - HTTP_PASSWORD=${REDIS_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${REDIS_ADMIN_PORT:-8081}:8081"
+    depends_on:
+      - redis
+    networks:
+      - ctp-network
+    profiles:
+      - debug
+    restart: unless-stopped
+
+  # Monitoring - Prometheus (Optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ctp-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - ctp-network
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+
+networks:
+  ctp-network:
+    driver: bridge

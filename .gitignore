@@ -1,6 +1,101 @@
-node_modules
-.env
-package-lock.json
-.roomodes
+# ===========================================
+# CTP - Git Ignore Configuration
+# ===========================================
 
-.roomodes
+# Environment Variables & Secrets
+.env
+.env.local
+.env.production
+.env.test
+*.env
+
+# Node.js Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Runtime & Build Outputs
+dist/
+build/
+out/
+.next/
+
+# Database Files
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+database.db*
+/data/
+
+# Log Files
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage & Test Reports
+coverage/
+.nyc_output/
+.coverage/
+*.lcov
+test-results/
+test-output/
+
+# IDE & Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker & Container Files
+.docker/
+docker-compose.override.yml
+
+# Temporary Files
+tmp/
+temp/
+.tmp/
+.temp/
+
+# Package Manager Lock Files (keep package-lock.json)
+package-lock.json
+
+# Runtime Configuration
+.npmrc
+
+# Monitoring & Metrics
+prometheus-data/
+grafana-data/
+
+# Backup Files
+*.backup
+*.bak
+*.old
+
+# Neo4j Data (if running locally)
+neo4j-data/
+neo4j-logs/
+
+# Redis Data
+redis-data/

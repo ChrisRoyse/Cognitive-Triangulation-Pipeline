@@ -2,6 +2,7 @@ const { DatabaseManager } = require('./utils/sqliteDb');
 const neo4jDriver = require('./utils/neo4jDriver');
 const { getInstance: getQueueManagerInstance } = require('./utils/queueManager');
 const { getCacheClient, closeCacheClient } = require('./utils/cacheClient');
+const { WorkerPoolManager } = require('./utils/workerPoolManager');
 const EntityScout = require('./agents/EntityScout');
 const FileAnalysisWorker = require('./workers/fileAnalysisWorker');
 const DirectoryResolutionWorker = require('./workers/directoryResolutionWorker');
@@ -22,9 +23,22 @@ class CognitiveTriangulationPipeline {
         this.runId = uuidv4();
         this.queueManager = getQueueManagerInstance();
         this.dbManager = new DatabaseManager(this.dbPath);
+        
+        // Initialize database schema early to avoid table not found errors
+        this.dbManager.initializeDb();
+        console.log('🚀 [main.js] Database schema initialized in constructor.');
+        
         this.cacheClient = getCacheClient();
         this.llmClient = getDeepseekClient();
+        
+        // Initialize WorkerPoolManager for intelligent concurrency control
+        this.workerPoolManager = new WorkerPoolManager({
+            environment: process.env.NODE_ENV || 'development',
+            maxGlobalConcurrency: parseInt(process.env.MAX_GLOBAL_CONCURRENCY) || undefined // Use default calculation
+        });
+        
         this.outboxPublisher = new TransactionalOutboxPublisher(this.dbManager, this.queueManager);
+        this.workers = []; // Track workers for cleanup
         this.metrics = {
             startTime: null,
             endTime: null,
@@ -35,8 +49,6 @@ class CognitiveTriangulationPipeline {
     async initialize() {
         console.log('🚀 [main.js] Initializing Cognitive Triangulation v2 Pipeline...');
         await this.queueManager.connect();
-        this.dbManager.initializeDb();
-        console.log('🚀 [main.js] Database schema initialized.');
         await this.clearDatabases();
         console.log('✅ [main.js] Databases and clients initialized successfully');
     }
@@ -77,14 +89,68 @@ class CognitiveTriangulationPipeline {
     }
 
     startWorkers() {
-        // Note: In a real distributed system, these would run in separate processes.
-        new FileAnalysisWorker(this.queueManager, this.dbManager, this.cacheClient, this.llmClient);
-        new DirectoryResolutionWorker(this.queueManager, this.dbManager, this.cacheClient, this.llmClient);
-        new DirectoryAggregationWorker(this.queueManager, this.cacheClient);
-        new RelationshipResolutionWorker(this.queueManager, this.dbManager, this.llmClient);
-        new ValidationWorker(this.queueManager, this.dbManager, this.cacheClient);
-        new ReconciliationWorker(this.queueManager, this.dbManager);
-        console.log('✅ All workers are running and listening for jobs.');
+        console.log('🚀 [main.js] Starting managed workers with intelligent concurrency control...');
+        
+        try {
+            // Create and initialize workers with WorkerPoolManager
+            const fileAnalysisWorker = new FileAnalysisWorker(
+                this.queueManager, 
+                this.dbManager, 
+                this.cacheClient, 
+                this.llmClient, 
+                this.workerPoolManager
+            );
+            this.workers.push(fileAnalysisWorker);
+            
+            const directoryResolutionWorker = new DirectoryResolutionWorker(
+                this.queueManager, 
+                this.dbManager, 
+                this.cacheClient, 
+                this.llmClient, 
+                this.workerPoolManager
+            );
+            this.workers.push(directoryResolutionWorker);
+            
+            const directoryAggregationWorker = new DirectoryAggregationWorker(
+                this.queueManager, 
+                this.cacheClient, 
+                this.workerPoolManager
+            );
+            this.workers.push(directoryAggregationWorker);
+            
+            const relationshipResolutionWorker = new RelationshipResolutionWorker(
+                this.queueManager, 
+                this.dbManager, 
+                this.llmClient, 
+                this.workerPoolManager
+            );
+            this.workers.push(relationshipResolutionWorker);
+            
+            const validationWorker = new ValidationWorker(
+                this.queueManager, 
+                this.dbManager, 
+                this.cacheClient, 
+                this.workerPoolManager
+            );
+            this.workers.push(validationWorker);
+            
+            const reconciliationWorker = new ReconciliationWorker(
+                this.queueManager, 
+                this.dbManager, 
+                this.workerPoolManager
+            );
+            this.workers.push(reconciliationWorker);
+            
+            console.log('✅ All managed workers are running and listening for jobs.');
+            
+            // Log worker pool status
+            const status = this.workerPoolManager.getStatus();
+            console.log(`📊 WorkerPoolManager Status: ${Object.keys(status.workers).length} workers registered, max global concurrency: ${status.globalConcurrency.max}`);
+            
+        } catch (error) {
+            console.error('❌ [main.js] Error starting workers:', error);
+            throw error;
+        }
     }
 
     async clearDatabases() {
@@ -157,15 +223,45 @@ class CognitiveTriangulationPipeline {
 
     async close() {
         console.log('🚀 [main.js] Closing connections...');
-        this.outboxPublisher.stop();
-        await this.queueManager.closeConnections();
-        await closeCacheClient();
-        const driver = neo4jDriver;
-        if (process.env.NODE_ENV !== 'test' && driver) {
-            await driver.close();
+        
+        try {
+            // Stop outbox publisher
+            this.outboxPublisher.stop();
+            
+            // Gracefully shutdown all workers
+            console.log('🛑 [main.js] Shutting down workers...');
+            const workerShutdowns = this.workers.map(async (worker) => {
+                if (worker && typeof worker.close === 'function') {
+                    try {
+                        await worker.close();
+                    } catch (error) {
+                        console.error('❌ Error closing worker:', error);
+                    }
+                }
+            });
+            await Promise.all(workerShutdowns);
+            
+            // Shutdown WorkerPoolManager
+            if (this.workerPoolManager) {
+                await this.workerPoolManager.shutdown();
+            }
+            
+            // Close other connections
+            await this.queueManager.closeConnections();
+            await closeCacheClient();
+            
+            const driver = neo4jDriver;
+            if (process.env.NODE_ENV !== 'test' && driver) {
+                await driver.close();
+            }
+            
+            this.dbManager.close();
+            console.log('✅ [main.js] All connections closed gracefully.');
+            
+        } catch (error) {
+            console.error('❌ [main.js] Error during cleanup:', error);
+            throw error;
         }
-        this.dbManager.close();
-        console.log('✅ [main.js] Connections closed.');
     }
 }
 

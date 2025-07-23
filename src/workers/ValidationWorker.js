@@ -1,10 +1,12 @@
 const { Worker } = require('bullmq');
+const { ManagedWorker } = require('./ManagedWorker');
 
 class ValidationWorker {
-    constructor(queueManager, dbManager, cacheClient) {
+    constructor(queueManager, dbManager, cacheClient, workerPoolManager, options = {}) {
         this.queueManager = queueManager;
         this.dbManager = dbManager;
         this.cacheClient = cacheClient;
+        this.workerPoolManager = workerPoolManager;
         this.reconciliationQueue = this.queueManager.getQueue('reconciliation-queue');
 
         // Define the Lua script for atomic evidence counting and checking
@@ -35,10 +37,56 @@ class ValidationWorker {
             `,
         });
 
-        this.worker = new Worker('analysis-findings-queue', this.process.bind(this), {
-            connection: this.queueManager.connection,
-            concurrency: 1, // Concurrency is now handled by batching, not multiple workers
-        });
+        if (!options.processOnly) {
+            if (workerPoolManager) {
+                // Create managed worker with intelligent concurrency control
+                this.managedWorker = new ManagedWorker('analysis-findings-queue', workerPoolManager, {
+                    workerType: 'validation',
+                    baseConcurrency: 5, // Can handle more validation tasks
+                    maxConcurrency: 20,
+                    minConcurrency: 1,
+                    rateLimitRequests: 15, // Higher rate for validation
+                    rateLimitWindow: 1000,
+                    failureThreshold: 5,
+                    resetTimeout: 60000,
+                    jobTimeout: 120000, // 2 minutes for validation
+                    retryAttempts: 3,
+                    retryDelay: 8000,
+                    ...options
+                });
+                
+                // Initialize the managed worker
+                this.initializeWorker();
+            } else {
+                // Fallback to basic worker if no WorkerPoolManager
+                this.worker = new Worker('analysis-findings-queue', this.process.bind(this), {
+                    connection: this.queueManager.connection,
+                    concurrency: 1, // Concurrency is now handled by batching, not multiple workers
+                });
+            }
+        }
+    }
+
+    async initializeWorker() {
+        try {
+            await this.managedWorker.initialize(
+                this.queueManager.connection,
+                this.process.bind(this)
+            );
+            
+            console.log('✅ ValidationWorker initialized with managed concurrency');
+        } catch (error) {
+            console.error('❌ Failed to initialize ValidationWorker:', error);
+            throw error;
+        }
+    }
+
+    async close() {
+        if (this.managedWorker) {
+            await this.managedWorker.shutdown();
+        } else if (this.worker) {
+            await this.worker.close();
+        }
     }
 
     async process(job) {

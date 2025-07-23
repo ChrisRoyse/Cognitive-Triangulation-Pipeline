@@ -1,14 +1,32 @@
 const { DatabaseManager } = require('../utils/sqliteDb');
 const QueueManager = require('../utils/queueManager');
+const BatchedDatabaseWriter = require('../utils/batchedDatabaseWriter');
 const crypto = require('crypto');
 
 class TransactionalOutboxPublisher {
-    constructor(dbManager, queueManager) {
+    constructor(dbManager, queueManager, batchOptions = {}) {
         this.dbManager = dbManager;
         this.queueManager = queueManager;
         this.pollingInterval = 1000; // 1 second
         this.intervalId = null;
         this.isPolling = false;
+        
+        // Initialize the batched database writer
+        this.batchWriter = new BatchedDatabaseWriter(dbManager, {
+            batchSize: batchOptions.batchSize || 100,
+            flushInterval: batchOptions.flushInterval || 500, // 500ms for outbox processing
+            maxRetries: batchOptions.maxRetries || 3,
+            enableStats: batchOptions.enableStats !== false
+        });
+        
+        // Set up event listeners for monitoring
+        this.batchWriter.on('batchProcessed', (info) => {
+            console.log(`[TransactionalOutboxPublisher] Batch processed: ${info.totalItems} items in ${info.processingTimeMs}ms`);
+        });
+        
+        this.batchWriter.on('batchError', (info) => {
+            console.error(`[TransactionalOutboxPublisher] Batch error:`, info.error);
+        });
     }
 
     start() {
@@ -29,6 +47,9 @@ class TransactionalOutboxPublisher {
         while (this.isPolling) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
+        
+        // Gracefully shut down the batch writer
+        await this.batchWriter.shutdown();
     }
 
     async pollAndPublish() {
@@ -54,6 +75,9 @@ class TransactionalOutboxPublisher {
             await this._handleBatchedRelationshipFindings(relationshipEvents);
         }
 
+        // Process other events and batch the status updates
+        const statusUpdates = [];
+        
         for (const event of otherEvents) {
             try {
                 if (event.event_type === 'file-analysis-finding') {
@@ -70,11 +94,17 @@ class TransactionalOutboxPublisher {
                     }
                 }
 
-                db.prepare("UPDATE outbox SET status = 'PUBLISHED' WHERE id = ?").run(event.id);
+                // Add to batch instead of immediate update
+                statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
             } catch (error) {
                 console.error(`[TransactionalOutboxPublisher] Failed to publish event ${event.id}:`, error);
-                db.prepare("UPDATE outbox SET status = 'FAILED' WHERE id = ?").run(event.id);
+                statusUpdates.push({ id: event.id, status: 'FAILED' });
             }
+        }
+        
+        // Batch process all status updates
+        if (statusUpdates.length > 0) {
+            this.batchWriter.addOutboxUpdatesBatch(statusUpdates);
         }
         this.isPolling = false;
     }
@@ -131,32 +161,24 @@ class TransactionalOutboxPublisher {
                 };
             });
 
-            const updateStmt = db.prepare("UPDATE outbox SET status = 'PUBLISHED' WHERE id = ?");
-            const transaction = db.transaction((eventIds) => {
-                for (const id of eventIds) {
-                    updateStmt.run(id);
-                }
-            });
-
             try {
                 await queue.add('validate-relationships-batch', {
                     runId: runId,
                     relationships: batchedPayload
                 });
 
-                const eventIds = events.map(e => e.id);
-                transaction(eventIds);
-                console.log(`[TransactionalOutboxPublisher] Published super-batch and marked ${eventIds.length} events as PUBLISHED.`);
+                // Use batch writer for status updates
+                const publishedUpdates = events.map(e => ({ id: e.id, status: 'PUBLISHED' }));
+                this.batchWriter.addOutboxUpdatesBatch(publishedUpdates);
+                
+                console.log(`[TransactionalOutboxPublisher] Published super-batch and queued ${events.length} events for status update.`);
 
             } catch (error) {
                 console.error(`[TransactionalOutboxPublisher] Failed to publish super-batch:`, error);
-                const updateFailedStmt = db.prepare("UPDATE outbox SET status = 'FAILED' WHERE id = ?");
-                const failedTransaction = db.transaction((eventIds) => {
-                    for (const id of eventIds) {
-                        updateFailedStmt.run(id);
-                    }
-                });
-                failedTransaction(events.map(e => e.id));
+                
+                // Use batch writer for failed status updates
+                const failedUpdates = events.map(e => ({ id: e.id, status: 'FAILED' }));
+                this.batchWriter.addOutboxUpdatesBatch(failedUpdates);
             }
         }
     }
@@ -171,6 +193,50 @@ class TransactionalOutboxPublisher {
                 console.warn(`[TransactionalOutboxPublisher] No queue configured for event type: ${eventType}`);
                 return null;
         }
+    }
+    
+    /**
+     * Get batch writer statistics and current outbox status
+     */
+    async getStats() {
+        const db = this.dbManager.getDb();
+        const batchStats = this.batchWriter.getStats();
+        
+        // Get current outbox counts
+        const pendingCount = db.prepare("SELECT COUNT(*) as count FROM outbox WHERE status = 'PENDING'").get().count;
+        const publishedCount = db.prepare("SELECT COUNT(*) as count FROM outbox WHERE status = 'PUBLISHED'").get().count;
+        const failedCount = db.prepare("SELECT COUNT(*) as count FROM outbox WHERE status = 'FAILED'").get().count;
+        
+        // Get WAL statistics
+        const walStats = this.batchWriter.getWALStats();
+        
+        return {
+            outbox: {
+                pending: pendingCount,
+                published: publishedCount,
+                failed: failedCount,
+                total: pendingCount + publishedCount + failedCount
+            },
+            batchWriter: batchStats,
+            wal: walStats,
+            isPolling: this.isPolling,
+            pollingInterval: this.pollingInterval
+        };
+    }
+    
+    /**
+     * Force flush all pending batches
+     */
+    async flushBatches() {
+        console.log('[TransactionalOutboxPublisher] Forcing batch flush...');
+        await this.batchWriter.flush();
+    }
+    
+    /**
+     * Perform WAL checkpoint to optimize database performance
+     */
+    checkpointWAL() {
+        return this.batchWriter.checkpointWAL();
     }
 }
 

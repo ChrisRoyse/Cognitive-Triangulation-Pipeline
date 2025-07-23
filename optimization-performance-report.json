@@ -1,0 +1,67 @@
+{
+  "executionSummary": {
+    "startTime": "2025-07-23T02:59:27.552Z",
+    "endTime": "2025-07-23T02:59:28.143Z",
+    "duration": "0.59 seconds",
+    "success": false
+  },
+  "databaseChanges": {
+    "outbox": {
+      "totalChange": 0,
+      "statusChanges": {
+        "PUBLISHED": 0
+      }
+    },
+    "filesChange": 0,
+    "poisChange": 0,
+    "relationshipsChange": 0,
+    "dirSummariesChange": 0,
+    "evidenceChange": 0
+  },
+  "optimizationEffectiveness": {
+    "filesProcessedRate": "N/A",
+    "poisCreatedRate": "N/A",
+    "relationshipsCreatedRate": "N/A"
+  },
+  "errorAnalysis": {
+    "totalErrors": 1,
+    "errors": [
+      "Pipeline execution: CognitiveTriangulationPipeline is not a constructor"
+    ],
+    "warnings": []
+  },
+  "beforeState": {
+    "outbox": {
+      "total": 1212,
+      "statusCounts": {
+        "PUBLISHED": 1212
+      }
+    },
+    "files": 0,
+    "pois": 0,
+    "relationships": 0,
+    "dirSummaries": 4,
+    "evidence": 0
+  },
+  "afterState": {
+    "outbox": {
+      "total": 1212,
+      "statusCounts": {
+        "PUBLISHED": 1212
+      }
+    },
+    "files": 0,
+    "pois": 0,
+    "relationships": 0,
+    "dirSummaries": 4,
+    "evidence": 0
+  },
+  "optimizationFeatures": {
+    "characterChunking": "ENABLED",
+    "fileBatching": "ENABLED",
+    "caching": "ENABLED",
+    "workerManagement": "ENABLED",
+    "databaseBatching": "ENABLED",
+    "redisIntegration": "ENABLED"
+  }
+}

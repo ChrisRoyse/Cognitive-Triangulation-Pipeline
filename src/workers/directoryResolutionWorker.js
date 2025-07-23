@@ -3,17 +3,66 @@ const path = require('path');
 const { Worker } = require('bullmq');
 const { v4: uuidv4 } = require('uuid');
 const LLMResponseSanitizer = require('../utils/LLMResponseSanitizer');
+const { ManagedWorker } = require('./ManagedWorker');
 
 class DirectoryResolutionWorker {
-    constructor(queueManager, dbManager, cacheClient, llmClient) {
+    constructor(queueManager, dbManager, cacheClient, llmClient, workerPoolManager, options = {}) {
         this.queueManager = queueManager;
         this.dbManager = dbManager; // This is the *central* DB manager
         this.cacheClient = cacheClient;
         this.llmClient = llmClient;
-        this.worker = new Worker('directory-resolution-queue', this.process.bind(this), {
-            connection: this.queueManager.connection,
-            concurrency: 2 // Lower concurrency for directory analysis
-        });
+        this.workerPoolManager = workerPoolManager;
+        
+        if (!options.processOnly) {
+            if (workerPoolManager) {
+                // Create managed worker with intelligent concurrency control
+                this.managedWorker = new ManagedWorker('directory-resolution-queue', workerPoolManager, {
+                    workerType: 'directory-resolution',
+                    baseConcurrency: 2, // Conservative for directory analysis
+                    maxConcurrency: 8,
+                    minConcurrency: 1,
+                    rateLimitRequests: 6, // Conservative for LLM calls
+                    rateLimitWindow: 1000,
+                    failureThreshold: 3,
+                    resetTimeout: 90000,
+                    jobTimeout: 240000, // 4 minutes for directory analysis
+                    retryAttempts: 2,
+                    retryDelay: 15000,
+                    ...options
+                });
+                
+                // Initialize the managed worker
+                this.initializeWorker();
+            } else {
+                // Fallback to basic worker if no WorkerPoolManager
+                this.worker = new Worker('directory-resolution-queue', this.process.bind(this), {
+                    connection: this.queueManager.connection,
+                    concurrency: 2 // Lower concurrency for directory analysis
+                });
+            }
+        }
+    }
+
+    async initializeWorker() {
+        try {
+            await this.managedWorker.initialize(
+                this.queueManager.connection,
+                this.process.bind(this)
+            );
+            
+            console.log('✅ DirectoryResolutionWorker initialized with managed concurrency');
+        } catch (error) {
+            console.error('❌ Failed to initialize DirectoryResolutionWorker:', error);
+            throw error;
+        }
+    }
+
+    async close() {
+        if (this.managedWorker) {
+            await this.managedWorker.shutdown();
+        } else if (this.worker) {
+            await this.worker.close();
+        }
     }
 
     async process(job) {
@@ -23,7 +72,16 @@ class DirectoryResolutionWorker {
         try {
             const fileContents = await this.getFileContents(directoryPath);
             const prompt = this.constructPrompt(directoryPath, fileContents);
-            const llmResponse = await this.llmClient.query(prompt);
+            
+            // Use WorkerPoolManager if available for intelligent retry and circuit breaking
+            const llmResponse = this.workerPoolManager
+                ? await this.workerPoolManager.executeWithManagement(
+                    'directory-resolution',
+                    () => this.llmClient.query(prompt),
+                    { directoryPath, fileCount: fileContents.length }
+                  )
+                : await this.llmClient.query(prompt);
+                
             const summary = this.parseResponse(llmResponse);
 
             const findingPayload = {

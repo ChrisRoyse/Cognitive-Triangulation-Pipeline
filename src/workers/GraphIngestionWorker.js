@@ -2,7 +2,10 @@ const neo4j = require('neo4j-driver');
 
 class GraphIngestionWorker {
     constructor(options) {
-        this.driver = neo4j.driver(options.neo4jUri, neo4j.auth.basic(options.neo4jUser, options.neo4jPassword));
+        this.driver = neo4j.driver(
+            options.neo4jUri, 
+            neo4j.auth.basic(options.neo4jUser, options.neo4jPassword)
+        );
     }
 
     async processJob(job) {

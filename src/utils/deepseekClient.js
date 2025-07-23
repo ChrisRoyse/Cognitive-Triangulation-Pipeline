@@ -1,6 +1,7 @@
 const https = require('https');
 require('dotenv').config();
 const config = require('../config');
+const { getCacheManager } = require('./cacheManager');
 
 /**
  * Pure DeepSeek LLM Client
@@ -17,6 +18,9 @@ class DeepSeekClient {
         this.requestQueue = [];
         
         this._apiKey = null;
+        this.cacheManager = getCacheManager();
+        
+        console.log('[DeepSeekClient] Initialized with caching support');
     }
 
     get apiKey() {
@@ -30,7 +34,7 @@ class DeepSeekClient {
         return this._apiKey;
     }
 
-    async call(prompt) {
+    async call(prompt, cacheOptions = {}) {
         const requestBody = JSON.stringify({
             model: 'deepseek-chat',
             messages: [
@@ -43,28 +47,53 @@ class DeepSeekClient {
             response_format: { type: 'json_object' }
         });
 
+        // Create cache key from prompt content
+        const promptContent = `${prompt.system}\n${prompt.user}`;
+        const options = {
+            model: 'deepseek-chat',
+            temperature: 0.0,
+            max_tokens: 8000,
+            ...cacheOptions
+        };
+
         try {
+            // Check cache first
+            const cachedResponse = await this.cacheManager.get(promptContent, options);
+            if (cachedResponse) {
+                console.log('[DeepSeekClient] Cache hit - returning cached response');
+                return cachedResponse;
+            }
+
+            // Cache miss - make API call
+            console.log('[DeepSeekClient] Cache miss - making API call');
             const response = await this._scheduleRequest('/chat/completions', 'POST', requestBody);
-            return {
+            
+            const result = {
                 body: response.choices[0].message.content,
-                usage: response.usage
+                usage: response.usage,
+                cached: false
             };
+
+            // Store in cache
+            await this.cacheManager.set(promptContent, result, options);
+            
+            return result;
         } catch (error) {
             console.error('DeepSeek API call failed after retries:', error.message);
             throw new Error(`DeepSeek API call failed: ${error.message}`);
         }
     }
 
-    async query(promptString) {
+    async query(promptString, cacheOptions = {}) {
         const prompt = {
             system: 'You are an expert software engineer specializing in code analysis.',
             user: promptString
         };
-        const response = await this.call(prompt);
+        const response = await this.call(prompt, cacheOptions);
         return response.body;
     }
 
-    async createChatCompletion(options) {
+    async createChatCompletion(options, cacheOptions = {}) {
         const requestBody = JSON.stringify({
             model: options.model || 'deepseek-chat',
             messages: options.messages,
@@ -73,9 +102,32 @@ class DeepSeekClient {
             response_format: options.response_format || { type: 'json_object' },
             stream: false
         });
- 
+
+        // Create cache key from messages content
+        const promptContent = options.messages.map(m => `${m.role}: ${m.content}`).join('\n');
+        const cacheOpts = {
+            model: options.model || 'deepseek-chat',
+            temperature: options.temperature || 0.0,
+            max_tokens: options.max_tokens || 8000,
+            ...cacheOptions
+        };
+
         try {
-            return await this._scheduleRequest('/chat/completions', 'POST', requestBody);
+            // Check cache first
+            const cachedResponse = await this.cacheManager.get(promptContent, cacheOpts);
+            if (cachedResponse) {
+                console.log('[DeepSeekClient] createChatCompletion cache hit');
+                return cachedResponse;
+            }
+
+            // Cache miss - make API call
+            console.log('[DeepSeekClient] createChatCompletion cache miss - making API call');
+            const response = await this._scheduleRequest('/chat/completions', 'POST', requestBody);
+
+            // Store in cache
+            await this.cacheManager.set(promptContent, response, cacheOpts);
+
+            return response;
         } catch (error) {
             console.error('[DeepSeekClient] createChatCompletion failed after all retries:', error.message);
             throw error;
@@ -187,12 +239,59 @@ class DeepSeekClient {
                 user: 'Hello, please respond with "Connection successful"'
             };
             
-            const response = await this.call(testPrompt);
+            // Don't cache test connections
+            const response = await this.call(testPrompt, { ttl: 60 }); // Short TTL for test
             return response.body.includes('Connection successful');
         } catch (error) {
             console.error('DeepSeek connection test failed:', error.message);
             return false;
         }
+    }
+
+    /**
+     * Get cache statistics
+     * @returns {object} - Cache statistics
+     */
+    getCacheStats() {
+        return this.cacheManager.getStats();
+    }
+
+    /**
+     * Clear cache entries
+     * @param {string} pattern - Optional pattern to match
+     * @returns {Promise<number>} - Number of entries cleared
+     */
+    async clearCache(pattern = null) {
+        if (pattern) {
+            return await this.cacheManager.invalidate(pattern);
+        }
+        return await this.cacheManager.clearAll();
+    }
+
+    /**
+     * Invalidate cache for specific file
+     * @param {string} filePath - File path to invalidate
+     * @returns {Promise<number>} - Number of entries invalidated
+     */
+    async invalidateFileCache(filePath) {
+        return await this.cacheManager.invalidateFile(filePath);
+    }
+
+    /**
+     * Warm cache with common patterns
+     * @param {Array} patterns - Patterns to warm
+     * @returns {Promise<void>}
+     */
+    async warmCache(patterns) {
+        return await this.cacheManager.warmCache(patterns);
+    }
+
+    /**
+     * Check cache health
+     * @returns {Promise<object>} - Health status
+     */
+    async cacheHealthCheck() {
+        return await this.cacheManager.healthCheck();
     }
 }
 

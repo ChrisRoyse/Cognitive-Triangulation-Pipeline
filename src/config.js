@@ -25,6 +25,12 @@ const config = {
   // Redis Configuration
   REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
   REDIS_PASSWORD: process.env.REDIS_PASSWORD || undefined,
+  REDIS_ENABLED: process.env.REDIS_ENABLED !== 'false',
+
+  // Cache Configuration
+  CACHE_ENABLED: process.env.CACHE_ENABLED !== 'false',
+  CACHE_DEFAULT_TTL: parseInt(process.env.CACHE_DEFAULT_TTL, 10) || 24 * 60 * 60, // 24 hours
+  CACHE_MAX_SIZE: parseInt(process.env.CACHE_MAX_SIZE, 10) || 1000000, // 1MB default
 
   // BullMQ Queue Names
   QUEUE_NAMES: [

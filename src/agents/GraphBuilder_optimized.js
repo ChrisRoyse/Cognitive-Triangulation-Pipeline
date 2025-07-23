@@ -1,0 +1,258 @@
+const neo4j = require('neo4j-driver');
+const config = require('../config');
+
+class GraphBuilder {
+    constructor(db, neo4jDriver, dbName) {
+        this.db = db;
+        this.neo4jDriver = neo4jDriver;
+        this.dbName = dbName;
+        this.config = {
+            batchSize: 10000, // Increased batch size for bulk operations
+            useApoc: true,    // Use APOC for better performance if available
+        };
+    }
+
+    async run() {
+        if (!this.neo4jDriver || !this.db) {
+            throw new Error('GraphBuilder requires valid database connections.');
+        }
+
+        try {
+            console.log('[GraphBuilder] Starting optimized graph building...');
+            
+            // First, create indexes for better performance
+            await this.createIndexes();
+            
+            const relCount = this.db.prepare("SELECT COUNT(*) as count FROM relationships WHERE status = 'VALIDATED'").get().count;
+            console.log(`[GraphBuilder] Processing ${relCount} validated relationships...`);
+
+            // Check if APOC is available
+            const hasApoc = await this.checkApocAvailability();
+            
+            if (hasApoc && this.config.useApoc) {
+                await this._persistWithApoc();
+            } else {
+                await this._persistWithUnwind();
+            }
+
+            console.log('[GraphBuilder] Graph building complete.');
+        } catch (error) {
+            console.error('[GraphBuilder] Error during graph building:', error);
+            throw error;
+        }
+    }
+
+    async createIndexes() {
+        const session = this.neo4jDriver.session({ database: this.dbName });
+        try {
+            console.log('[GraphBuilder] Creating indexes for better performance...');
+            
+            // Create index on POI id for faster lookups
+            await session.run('CREATE INDEX poi_id_index IF NOT EXISTS FOR (p:POI) ON (p.id)');
+            
+            // Create index on relationship type
+            await session.run('CREATE INDEX rel_type_index IF NOT EXISTS FOR ()-[r:RELATIONSHIP]-() ON (r.type)');
+            
+            console.log('[GraphBuilder] Indexes created successfully.');
+        } catch (error) {
+            console.warn('[GraphBuilder] Could not create indexes:', error.message);
+        } finally {
+            await session.close();
+        }
+    }
+
+    async checkApocAvailability() {
+        const session = this.neo4jDriver.session({ database: this.dbName });
+        try {
+            await session.run('RETURN apoc.version() as version');
+            console.log('[GraphBuilder] APOC is available, using optimized bulk import.');
+            return true;
+        } catch (error) {
+            console.log('[GraphBuilder] APOC not available, falling back to UNWIND method.');
+            return false;
+        } finally {
+            await session.close();
+        }
+    }
+
+    async _persistWithApoc() {
+        console.log('[GraphBuilder] Using APOC periodic.iterate for optimal performance...');
+        
+        // First, export all validated relationships to a temporary collection
+        const relationships = this.db.prepare(`
+            SELECT
+                r.id as relationship_id,
+                r.type as relationship_type,
+                r.confidence_score AS confidence_score,
+                s.id as source_id,
+                s.file_path as source_file_path,
+                s.name as source_name,
+                s.type as source_type,
+                s.start_line as source_start_line,
+                s.end_line as source_end_line,
+                t.id as target_id,
+                t.file_path as target_file_path,
+                t.name as target_name,
+                t.type as target_type,
+                t.start_line as target_start_line,
+                t.end_line as target_end_line
+            FROM relationships r
+            JOIN pois s ON r.source_poi_id = s.id
+            JOIN pois t ON r.target_poi_id = t.id
+            WHERE r.status = 'VALIDATED'
+        `).all();
+
+        // Transform data for Neo4j
+        const transformedData = relationships.map(row => ({
+            sourceId: this.generateSemanticId({ type: row.source_type, name: row.source_name }, row.source_file_path, row.source_start_line),
+            sourceName: row.source_name,
+            sourceType: row.source_type,
+            sourceFilePath: row.source_file_path,
+            sourceStartLine: row.source_start_line,
+            sourceEndLine: row.source_end_line,
+            targetId: this.generateSemanticId({ type: row.target_type, name: row.target_name }, row.target_file_path, row.target_start_line),
+            targetName: row.target_name,
+            targetType: row.target_type,
+            targetFilePath: row.target_file_path,
+            targetStartLine: row.target_start_line,
+            targetEndLine: row.target_end_line,
+            relType: row.relationship_type,
+            confidence: row.confidence_score || 0.8
+        }));
+
+        const session = this.neo4jDriver.session({ database: this.dbName });
+        try {
+            // Use APOC periodic.iterate for batch processing
+            const cypher = `
+                CALL apoc.periodic.iterate(
+                    'UNWIND $data as row RETURN row',
+                    '
+                    MERGE (source:POI {id: row.sourceId})
+                    ON CREATE SET 
+                        source.name = row.sourceName,
+                        source.type = row.sourceType,
+                        source.file_path = row.sourceFilePath,
+                        source.start_line = row.sourceStartLine,
+                        source.end_line = row.sourceEndLine
+                    MERGE (target:POI {id: row.targetId})
+                    ON CREATE SET 
+                        target.name = row.targetName,
+                        target.type = row.targetType,
+                        target.file_path = row.targetFilePath,
+                        target.start_line = row.targetStartLine,
+                        target.end_line = row.targetEndLine
+                    MERGE (source)-[r:RELATIONSHIP {type: row.relType}]->(target)
+                    SET r.confidence = row.confidence
+                    ',
+                    {batchSize: $batchSize, parallel: true, params: {data: $data}}
+                ) YIELD batches, total, errorMessages
+                RETURN batches, total, errorMessages
+            `;
+
+            const result = await session.run(cypher, { 
+                data: transformedData,
+                batchSize: this.config.batchSize 
+            });
+
+            const summary = result.records[0].toObject();
+            console.log(`[GraphBuilder] APOC import completed: ${summary.total} items in ${summary.batches} batches`);
+            
+            if (summary.errorMessages && summary.errorMessages.length > 0) {
+                console.error('[GraphBuilder] Errors during import:', summary.errorMessages);
+            }
+        } finally {
+            await session.close();
+        }
+    }
+
+    async _persistWithUnwind() {
+        console.log('[GraphBuilder] Using optimized UNWIND method...');
+        
+        const relationshipQuery = `
+            SELECT
+                r.id as relationship_id,
+                r.type as relationship_type,
+                r.confidence_score AS confidence_score,
+                s.id as source_id,
+                s.file_path as source_file_path,
+                s.name as source_name,
+                s.type as source_type,
+                s.start_line as source_start_line,
+                s.end_line as source_end_line,
+                t.id as target_id,
+                t.file_path as target_file_path,
+                t.name as target_name,
+                t.type as target_type,
+                t.start_line as target_start_line,
+                t.end_line as target_end_line
+            FROM relationships r
+            JOIN pois s ON r.source_poi_id = s.id
+            JOIN pois t ON r.target_poi_id = t.id
+            WHERE r.status = 'VALIDATED'
+        `;
+
+        const relationships = this.db.prepare(relationshipQuery).all();
+        const totalRelationships = relationships.length;
+        console.log(`[GraphBuilder] Loading ${totalRelationships} relationships for bulk import...`);
+
+        // Process in larger batches
+        for (let i = 0; i < totalRelationships; i += this.config.batchSize) {
+            const batch = relationships.slice(i, i + this.config.batchSize).map(row => ({
+                source: {
+                    id: this.generateSemanticId({ type: row.source_type, name: row.source_name }, row.source_file_path, row.source_start_line),
+                    file_path: row.source_file_path,
+                    name: row.source_name,
+                    type: row.source_type,
+                    start_line: row.source_start_line,
+                    end_line: row.source_end_line,
+                },
+                target: {
+                    id: this.generateSemanticId({ type: row.target_type, name: row.target_name }, row.target_file_path, row.target_start_line),
+                    file_path: row.target_file_path,
+                    name: row.target_name,
+                    type: row.target_type,
+                    start_line: row.target_start_line,
+                    end_line: row.target_end_line,
+                },
+                relationship: {
+                    type: row.relationship_type,
+                    confidence: row.confidence_score || 0.8,
+                }
+            }));
+
+            await this._runOptimizedBatch(batch);
+            console.log(`[GraphBuilder] Processed ${Math.min(i + this.config.batchSize, totalRelationships)}/${totalRelationships} relationships`);
+        }
+    }
+
+    async _runOptimizedBatch(batch) {
+        const session = this.neo4jDriver.session({ database: this.dbName });
+        try {
+            // Use a single transaction for the entire batch
+            await session.writeTransaction(async tx => {
+                const cypher = `
+                    UNWIND $batch as item
+                    MERGE (source:POI {id: item.source.id})
+                    ON CREATE SET source = item.source
+                    MERGE (target:POI {id: item.target.id})
+                    ON CREATE SET target = item.target
+                    MERGE (source)-[r:RELATIONSHIP {type: item.relationship.type}]->(target)
+                    SET r.confidence = item.relationship.confidence
+                `;
+                await tx.run(cypher, { batch });
+            });
+        } catch (error) {
+            console.error(`[GraphBuilder] Error processing batch:`, error);
+            throw error;
+        } finally {
+            await session.close();
+        }
+    }
+
+    generateSemanticId(poi, filePath, startLine) {
+        if (poi.type === 'file') return filePath;
+        return `${poi.type}:${poi.name}@${filePath}:${startLine}`;
+    }
+}
+
+module.exports = GraphBuilder;

@@ -1,0 +1,637 @@
+/**
+ * Comprehensive Error Handling System
+ * 
+ * Features:
+ * - Centralized error classification and handling
+ * - Automatic retry logic with backoff strategies
+ * - Error recovery patterns
+ * - Error reporting and metrics
+ * - Context preservation and debugging
+ * - Integration with circuit breakers
+ */
+
+const resourceManager = require('./resourceManager');
+const { registry: circuitBreakerRegistry } = require('./circuitBreaker');
+
+/**
+ * Error Classifications
+ */
+const ErrorTypes = {
+    // Network and connectivity errors
+    NETWORK_ERROR: 'network_error',
+    CONNECTION_TIMEOUT: 'connection_timeout',
+    CONNECTION_REFUSED: 'connection_refused',
+    CONNECTION_RESET: 'connection_reset',
+    
+    // Service errors
+    SERVICE_UNAVAILABLE: 'service_unavailable',
+    SERVICE_TIMEOUT: 'service_timeout',
+    RATE_LIMITED: 'rate_limited',
+    AUTHENTICATION_ERROR: 'authentication_error',
+    AUTHORIZATION_ERROR: 'authorization_error',
+    
+    // Application errors
+    VALIDATION_ERROR: 'validation_error',
+    BUSINESS_LOGIC_ERROR: 'business_logic_error',
+    DATA_NOT_FOUND: 'data_not_found',
+    CONFIGURATION_ERROR: 'configuration_error',
+    
+    // System errors
+    OUT_OF_MEMORY: 'out_of_memory',
+    DISK_FULL: 'disk_full',
+    PERMISSION_DENIED: 'permission_denied',
+    RESOURCE_EXHAUSTED: 'resource_exhausted',
+    
+    // Unknown errors
+    UNKNOWN_ERROR: 'unknown_error'
+};
+
+/**
+ * Retry Strategies
+ */
+const RetryStrategies = {
+    NONE: 'none',
+    FIXED_DELAY: 'fixed_delay',
+    LINEAR_BACKOFF: 'linear_backoff',
+    EXPONENTIAL_BACKOFF: 'exponential_backoff',
+    EXPONENTIAL_BACKOFF_WITH_JITTER: 'exponential_backoff_with_jitter'
+};
+
+/**
+ * Enhanced Error Class with Context
+ */
+class EnhancedError extends Error {
+    constructor(message, options = {}) {
+        super(message);
+        
+        this.name = this.constructor.name;
+        this.type = options.type || ErrorTypes.UNKNOWN_ERROR;
+        this.code = options.code;
+        this.statusCode = options.statusCode;
+        this.context = options.context || {};
+        this.timestamp = new Date();
+        this.retryable = options.retryable !== undefined ? options.retryable : this.isRetryable();
+        this.severity = options.severity || 'error';
+        this.component = options.component;
+        this.operation = options.operation;
+        this.correlationId = options.correlationId || this.generateCorrelationId();
+        
+        // Preserve original error if wrapped
+        this.originalError = options.originalError;
+        
+        // Capture stack trace
+        if (Error.captureStackTrace) {
+            Error.captureStackTrace(this, this.constructor);
+        }
+    }
+
+    /**
+     * Determine if error is retryable based on type
+     */
+    isRetryable() {
+        const retryableTypes = [
+            ErrorTypes.NETWORK_ERROR,
+            ErrorTypes.CONNECTION_TIMEOUT,
+            ErrorTypes.CONNECTION_RESET,
+            ErrorTypes.SERVICE_UNAVAILABLE,
+            ErrorTypes.SERVICE_TIMEOUT,
+            ErrorTypes.RATE_LIMITED
+        ];
+        
+        return retryableTypes.includes(this.type);
+    }
+
+    /**
+     * Generate correlation ID for error tracking
+     */
+    generateCorrelationId() {
+        return `error_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    /**
+     * Convert to JSON for logging
+     */
+    toJSON() {
+        return {
+            name: this.name,
+            message: this.message,
+            type: this.type,
+            code: this.code,
+            statusCode: this.statusCode,
+            context: this.context,
+            timestamp: this.timestamp,
+            retryable: this.retryable,
+            severity: this.severity,
+            component: this.component,
+            operation: this.operation,
+            correlationId: this.correlationId,
+            stack: this.stack,
+            originalError: this.originalError ? this.originalError.message : undefined
+        };
+    }
+}
+
+/**
+ * Comprehensive Error Handler
+ */
+class ErrorHandler {
+    constructor() {
+        this.stats = {
+            errors: {
+                total: 0,
+                byType: new Map(),
+                byComponent: new Map(),
+                bySeverity: new Map()
+            },
+            retries: {
+                total: 0,
+                successful: 0,
+                failed: 0,
+                byStrategy: new Map()
+            },
+            recoveries: {
+                successful: 0,
+                failed: 0
+            }
+        };
+        
+        this.errorHandlers = new Map();
+        this.retryPolicies = new Map();
+        this.recoveryHandlers = new Map();
+        this.circuitBreakers = new Map();
+        
+        // Setup default handlers
+        this.setupDefaultHandlers();
+        
+        // Register for cleanup
+        resourceManager.register('ErrorHandler', this);
+    }
+
+    /**
+     * Setup default error handlers
+     */
+    setupDefaultHandlers() {
+        // Network error handler
+        this.registerHandler(ErrorTypes.NETWORK_ERROR, async (error) => {
+            console.warn(`🌐 Network error: ${error.message}`);
+            return this.getRetryRecommendation(error);
+        });
+        
+        // Service unavailable handler
+        this.registerHandler(ErrorTypes.SERVICE_UNAVAILABLE, async (error) => {
+            console.warn(`🚫 Service unavailable: ${error.message}`);
+            
+            // Open circuit breaker if component specified
+            if (error.component) {
+                const breaker = circuitBreakerRegistry.get(error.component);
+                breaker.forceOpen(`Service unavailable: ${error.message}`);
+            }
+            
+            return this.getRetryRecommendation(error);
+        });
+        
+        // Rate limit handler
+        this.registerHandler(ErrorTypes.RATE_LIMITED, async (error) => {
+            console.warn(`🚦 Rate limited: ${error.message}`);
+            
+            // Extract retry-after header if available
+            const retryAfter = error.context?.retryAfter || 60;
+            return {
+                shouldRetry: true,
+                delay: retryAfter * 1000,
+                strategy: RetryStrategies.FIXED_DELAY
+            };
+        });
+        
+        // Authentication error handler
+        this.registerHandler(ErrorTypes.AUTHENTICATION_ERROR, async (error) => {
+            console.error(`🔐 Authentication error: ${error.message}`);
+            
+            // Try to refresh token or re-authenticate
+            if (error.context?.refreshable) {
+                return { shouldRetry: true, delay: 1000 };
+            }
+            
+            return { shouldRetry: false, fatal: true };
+        });
+        
+        // Out of memory handler
+        this.registerHandler(ErrorTypes.OUT_OF_MEMORY, async (error) => {
+            console.error(`💾 Out of memory: ${error.message}`);
+            
+            // Trigger garbage collection if available
+            if (global.gc) {
+                global.gc();
+                console.log('🗑️  Emergency garbage collection triggered');
+            }
+            
+            // Reduce processing load
+            return { 
+                shouldRetry: true, 
+                delay: 5000,
+                recommendations: ['reduce_batch_size', 'clear_caches', 'restart_workers']
+            };
+        });
+    }
+
+    /**
+     * Register custom error handler
+     */
+    registerHandler(errorType, handler) {
+        this.errorHandlers.set(errorType, handler);
+    }
+
+    /**
+     * Register retry policy for specific error types
+     */
+    registerRetryPolicy(errorType, policy) {
+        this.retryPolicies.set(errorType, policy);
+    }
+
+    /**
+     * Register recovery handler for specific components
+     */
+    registerRecoveryHandler(component, handler) {
+        this.recoveryHandlers.set(component, handler);
+    }
+
+    /**
+     * Main error handling method
+     */
+    async handle(error, context = {}) {
+        try {
+            // Enhance error with context if it's not already an EnhancedError
+            const enhancedError = this.enhanceError(error, context);
+            
+            // Update statistics
+            this.updateStats(enhancedError);
+            
+            // Log error
+            this.logError(enhancedError);
+            
+            // Get specific handler for error type
+            const handler = this.errorHandlers.get(enhancedError.type);
+            let handlerResult = { shouldRetry: false };
+            
+            if (handler) {
+                handlerResult = await handler(enhancedError);
+            } else {
+                handlerResult = this.getRetryRecommendation(enhancedError);
+            }
+            
+            // Try recovery if applicable
+            if (enhancedError.component && this.recoveryHandlers.has(enhancedError.component)) {
+                const recoveryHandler = this.recoveryHandlers.get(enhancedError.component);
+                const recoveryResult = await this.attemptRecovery(recoveryHandler, enhancedError);
+                
+                if (recoveryResult.recovered) {
+                    this.stats.recoveries.successful++;
+                    return { ...handlerResult, recovered: true };
+                } else {
+                    this.stats.recoveries.failed++;
+                }
+            }
+            
+            return {
+                error: enhancedError,
+                ...handlerResult
+            };
+            
+        } catch (handlingError) {
+            console.error('❌ Error in error handler:', handlingError);
+            return {
+                error: this.enhanceError(error, context),
+                shouldRetry: false,
+                fatal: true
+            };
+        }
+    }
+
+    /**
+     * Enhance plain error with additional context
+     */
+    enhanceError(error, context = {}) {
+        if (error instanceof EnhancedError) {
+            return error;
+        }
+        
+        const errorType = this.classifyError(error);
+        
+        return new EnhancedError(error.message, {
+            type: errorType,
+            code: error.code,
+            statusCode: error.statusCode || error.status,
+            context: { ...context, ...error.context },
+            originalError: error,
+            component: context.component,
+            operation: context.operation,
+            correlationId: context.correlationId,
+            retryable: context.retryable
+        });
+    }
+
+    /**
+     * Classify error type based on error properties
+     */
+    classifyError(error) {
+        // Network errors
+        if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+            return ErrorTypes.NETWORK_ERROR;
+        }
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET') {
+            return ErrorTypes.CONNECTION_TIMEOUT;
+        }
+        
+        // HTTP status codes
+        if (error.statusCode || error.status) {
+            const status = error.statusCode || error.status;
+            if (status === 429) return ErrorTypes.RATE_LIMITED;
+            if (status === 401) return ErrorTypes.AUTHENTICATION_ERROR;
+            if (status === 403) return ErrorTypes.AUTHORIZATION_ERROR;
+            if (status >= 500) return ErrorTypes.SERVICE_UNAVAILABLE;
+        }
+        
+        // System errors
+        if (error.code === 'EACCES') return ErrorTypes.PERMISSION_DENIED;
+        if (error.code === 'ENOSPC') return ErrorTypes.DISK_FULL;
+        if (error.message?.includes('out of memory')) return ErrorTypes.OUT_OF_MEMORY;
+        
+        // Application errors
+        if (error.name === 'ValidationError') return ErrorTypes.VALIDATION_ERROR;
+        if (error.name === 'NotFoundError') return ErrorTypes.DATA_NOT_FOUND;
+        
+        return ErrorTypes.UNKNOWN_ERROR;
+    }
+
+    /**
+     * Get retry recommendation based on error
+     */
+    getRetryRecommendation(error) {
+        const policy = this.retryPolicies.get(error.type);
+        
+        if (policy) {
+            return policy;
+        }
+        
+        // Default retry logic
+        if (!error.retryable) {
+            return { shouldRetry: false };
+        }
+        
+        switch (error.type) {
+            case ErrorTypes.RATE_LIMITED:
+                return {
+                    shouldRetry: true,
+                    maxAttempts: 3,
+                    delay: 60000, // 1 minute
+                    strategy: RetryStrategies.FIXED_DELAY
+                };
+                
+            case ErrorTypes.SERVICE_UNAVAILABLE:
+                return {
+                    shouldRetry: true,
+                    maxAttempts: 5,
+                    delay: 1000,
+                    strategy: RetryStrategies.EXPONENTIAL_BACKOFF_WITH_JITTER
+                };
+                
+            case ErrorTypes.NETWORK_ERROR:
+                return {
+                    shouldRetry: true,
+                    maxAttempts: 3,
+                    delay: 2000,
+                    strategy: RetryStrategies.EXPONENTIAL_BACKOFF
+                };
+                
+            default:
+                return {
+                    shouldRetry: true,
+                    maxAttempts: 2,
+                    delay: 1000,
+                    strategy: RetryStrategies.LINEAR_BACKOFF
+                };
+        }
+    }
+
+    /**
+     * Execute operation with retry logic
+     */
+    async executeWithRetry(operation, options = {}) {
+        const maxAttempts = options.maxAttempts || 3;
+        const strategy = options.strategy || RetryStrategies.EXPONENTIAL_BACKOFF;
+        const baseDelay = options.delay || 1000;
+        const context = options.context || {};
+        
+        let lastError;
+        
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const result = await operation();
+                
+                // Success - update retry stats
+                if (attempt > 1) {
+                    this.stats.retries.successful++;
+                }
+                
+                return result;
+                
+            } catch (error) {
+                lastError = error;
+                
+                // Handle the error
+                const handlerResult = await this.handle(error, { 
+                    ...context, 
+                    attempt, 
+                    maxAttempts 
+                });
+                
+                // Check if we should retry
+                if (!handlerResult.shouldRetry || attempt >= maxAttempts) {
+                    this.stats.retries.failed++;
+                    throw handlerResult.error;
+                }
+                
+                // Calculate delay for next attempt
+                const delay = this.calculateDelay(strategy, attempt, baseDelay);
+                
+                this.stats.retries.total++;
+                this.stats.retries.byStrategy.set(strategy, 
+                    (this.stats.retries.byStrategy.get(strategy) || 0) + 1
+                );
+                
+                console.warn(`⚠️  Retry attempt ${attempt}/${maxAttempts} in ${delay}ms:`, error.message);
+                
+                await this.sleep(delay);
+            }
+        }
+        
+        throw lastError;
+    }
+
+    /**
+     * Calculate delay based on retry strategy
+     */
+    calculateDelay(strategy, attempt, baseDelay) {
+        switch (strategy) {
+            case RetryStrategies.FIXED_DELAY:
+                return baseDelay;
+                
+            case RetryStrategies.LINEAR_BACKOFF:
+                return baseDelay * attempt;
+                
+            case RetryStrategies.EXPONENTIAL_BACKOFF:
+                return baseDelay * Math.pow(2, attempt - 1);
+                
+            case RetryStrategies.EXPONENTIAL_BACKOFF_WITH_JITTER:
+                const exponentialDelay = baseDelay * Math.pow(2, attempt - 1);
+                const jitter = Math.random() * 1000;
+                return exponentialDelay + jitter;
+                
+            default:
+                return baseDelay;
+        }
+    }
+
+    /**
+     * Attempt recovery using registered handler
+     */
+    async attemptRecovery(recoveryHandler, error) {
+        try {
+            console.log(`🔧 Attempting recovery for component: ${error.component}`);
+            const result = await recoveryHandler(error);
+            
+            if (result.recovered) {
+                console.log(`✅ Recovery successful for component: ${error.component}`);
+            }
+            
+            return result;
+        } catch (recoveryError) {
+            console.error(`❌ Recovery failed for component: ${error.component}`, recoveryError);
+            return { recovered: false, error: recoveryError };
+        }
+    }
+
+    /**
+     * Update error statistics
+     */
+    updateStats(error) {
+        this.stats.errors.total++;
+        
+        // By type
+        const typeCount = this.stats.errors.byType.get(error.type) || 0;
+        this.stats.errors.byType.set(error.type, typeCount + 1);
+        
+        // By component
+        if (error.component) {
+            const componentCount = this.stats.errors.byComponent.get(error.component) || 0;
+            this.stats.errors.byComponent.set(error.component, componentCount + 1);
+        }
+        
+        // By severity
+        const severityCount = this.stats.errors.bySeverity.get(error.severity) || 0;
+        this.stats.errors.bySeverity.set(error.severity, severityCount + 1);
+    }
+
+    /**
+     * Log error with appropriate level
+     */
+    logError(error) {
+        const logData = {
+            correlationId: error.correlationId,
+            type: error.type,
+            component: error.component,
+            operation: error.operation,
+            message: error.message,
+            context: error.context,
+            timestamp: error.timestamp
+        };
+        
+        switch (error.severity) {
+            case 'critical':
+                console.error('💥 CRITICAL ERROR:', logData);
+                break;
+            case 'error':
+                console.error('❌ ERROR:', logData);
+                break;
+            case 'warning':
+                console.warn('⚠️  WARNING:', logData);
+                break;
+            default:
+                console.log('ℹ️  INFO:', logData);
+        }
+    }
+
+    /**
+     * Sleep helper
+     */
+    async sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * Get comprehensive statistics
+     */
+    getStats() {
+        return {
+            errors: {
+                total: this.stats.errors.total,
+                byType: Object.fromEntries(this.stats.errors.byType),
+                byComponent: Object.fromEntries(this.stats.errors.byComponent),
+                bySeverity: Object.fromEntries(this.stats.errors.bySeverity)
+            },
+            retries: {
+                total: this.stats.retries.total,
+                successful: this.stats.retries.successful,
+                failed: this.stats.retries.failed,
+                successRate: this.stats.retries.total > 0 
+                    ? (this.stats.retries.successful / this.stats.retries.total) * 100 
+                    : 0,
+                byStrategy: Object.fromEntries(this.stats.retries.byStrategy)
+            },
+            recoveries: this.stats.recoveries
+        };
+    }
+
+    /**
+     * Health check
+     */
+    async healthCheck() {
+        try {
+            const stats = this.getStats();
+            const errorRate = stats.errors.total > 0 
+                ? ((stats.errors.total - stats.retries.successful) / stats.errors.total) * 100
+                : 0;
+            
+            return {
+                healthy: errorRate < 10, // Less than 10% error rate
+                errorRate: Math.round(errorRate),
+                stats: stats,
+                timestamp: new Date().toISOString()
+            };
+        } catch (error) {
+            return {
+                healthy: false,
+                error: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
+    }
+
+    /**
+     * Clean up resources
+     */
+    async close() {
+        console.log('✅ ErrorHandler cleaned up');
+    }
+}
+
+// Global error handler instance
+const globalErrorHandler = new ErrorHandler();
+
+module.exports = {
+    ErrorHandler,
+    EnhancedError,
+    ErrorTypes,
+    RetryStrategies,
+    globalErrorHandler
+};

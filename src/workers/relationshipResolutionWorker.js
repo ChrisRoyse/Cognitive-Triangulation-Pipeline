@@ -1,15 +1,64 @@
 const { Worker } = require('bullmq');
 const { v4: uuidv4 } = require('uuid');
+const { ManagedWorker } = require('./ManagedWorker');
 
 class RelationshipResolutionWorker {
-    constructor(queueManager, dbManager, llmClient) {
+    constructor(queueManager, dbManager, llmClient, workerPoolManager, options = {}) {
         this.queueManager = queueManager;
         this.dbManager = dbManager;
         this.llmClient = llmClient;
-        this.worker = new Worker('relationship-resolution-queue', this.process.bind(this), {
-            connection: this.queueManager.connection,
-            concurrency: 2 // Reduced concurrency to avoid overwhelming the API
-        });
+        this.workerPoolManager = workerPoolManager;
+        
+        if (!options.processOnly) {
+            if (workerPoolManager) {
+                // Create managed worker with intelligent concurrency control
+                this.managedWorker = new ManagedWorker('relationship-resolution-queue', workerPoolManager, {
+                    workerType: 'relationship-resolution',
+                    baseConcurrency: 2, // Conservative for LLM calls
+                    maxConcurrency: 12,
+                    minConcurrency: 1,
+                    rateLimitRequests: 6, // Conservative for relationship analysis
+                    rateLimitWindow: 1000,
+                    failureThreshold: 3,
+                    resetTimeout: 90000,
+                    jobTimeout: 300000, // 5 minutes for relationship resolution
+                    retryAttempts: 2,
+                    retryDelay: 12000,
+                    ...options
+                });
+                
+                // Initialize the managed worker
+                this.initializeWorker();
+            } else {
+                // Fallback to basic worker if no WorkerPoolManager
+                this.worker = new Worker('relationship-resolution-queue', this.process.bind(this), {
+                    connection: this.queueManager.connection,
+                    concurrency: 2 // Reduced concurrency to avoid overwhelming the API
+                });
+            }
+        }
+    }
+
+    async initializeWorker() {
+        try {
+            await this.managedWorker.initialize(
+                this.queueManager.connection,
+                this.process.bind(this)
+            );
+            
+            console.log('✅ RelationshipResolutionWorker initialized with managed concurrency');
+        } catch (error) {
+            console.error('❌ Failed to initialize RelationshipResolutionWorker:', error);
+            throw error;
+        }
+    }
+
+    async close() {
+        if (this.managedWorker) {
+            await this.managedWorker.shutdown();
+        } else if (this.worker) {
+            await this.worker.close();
+        }
     }
 
     async process(job) {
@@ -26,7 +75,15 @@ class RelationshipResolutionWorker {
             const prompt = this.constructPrompt(filePath, primaryPoi, contextualPois);
             
             console.log(`[RelationshipResolutionWorker] Querying LLM for ${filePath} POI ${primaryPoi.id}`);
-            const llmResponse = await this.llmClient.query(prompt);
+            
+            // Use WorkerPoolManager if available for intelligent retry and circuit breaking
+            const llmResponse = this.workerPoolManager
+                ? await this.workerPoolManager.executeWithManagement(
+                    'relationship-resolution',
+                    () => this.llmClient.query(prompt),
+                    { filePath, primaryPoiId: primaryPoi.id, contextualPoisCount: contextualPois.length }
+                  )
+                : await this.llmClient.query(prompt);
 
             console.log(`[RelationshipResolutionWorker] Parsing LLM response for ${filePath} POI ${primaryPoi.id}`);
             const relationships = this.parseResponse(llmResponse);
