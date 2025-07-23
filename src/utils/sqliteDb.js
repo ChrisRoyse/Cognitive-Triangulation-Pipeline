@@ -103,6 +103,26 @@ class DatabaseManager {
                 console.error('Migration to V1 failed:', error);
             }
         }
+
+        if (version < 2) {
+            const migrateToV2 = db.transaction(() => {
+                // Add relationship_hash column to relationship_evidence table
+                const evidenceColumns = db.pragma('table_info(relationship_evidence)');
+                const evidenceColumnNames = evidenceColumns.map(col => col.name);
+                
+                if (!evidenceColumnNames.includes('relationship_hash')) {
+                    db.exec('ALTER TABLE relationship_evidence ADD COLUMN relationship_hash TEXT;');
+                }
+
+                db.pragma('user_version = 2');
+            });
+
+            try {
+                migrateToV2();
+            } catch (error) {
+                console.error('Migration to V2 failed:', error);
+            }
+        }
     }
 
     /**

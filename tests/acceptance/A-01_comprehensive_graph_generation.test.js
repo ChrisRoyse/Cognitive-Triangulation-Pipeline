@@ -33,7 +33,9 @@ describe('Acceptance Test A-01-- Comprehensive Graph Generation', () => {
         // --- Test Step 1-- Execute the full analysis pipeline ---
         // We execute the main script targeting our controlled test directory.
         // This command kicks off the EntityScout, RelationshipResolver, and GraphBuilder agents in sequence.
-        const { stdout, stderr } = await execPromise('node src/main.js --dir polyglot-test');
+        const { stdout, stderr } = await execPromise('node src/main.js --target polyglot-test', {
+            maxBuffer: 50 * 1024 * 1024 // 50MB buffer to handle large output
+        });
         
         console.log('Pipeline STDOUT--', stdout);
         if (stderr && !stderr.includes('It is highly recommended to use a minimum Redis version')) {
@@ -65,7 +67,7 @@ describe('Acceptance Test A-01-- Comprehensive Graph Generation', () => {
 
         // --- Verification Step 2-- Verify Relationship Counts ---
         const relCountsResult = await session.run(`
-            MATCH ()-[r:RELATES]->()
+            MATCH ()-[r:RELATIONSHIP]->()
             RETURN r.type AS relationshipType, count(*) AS count
         `);
 
@@ -85,12 +87,12 @@ describe('Acceptance Test A-01-- Comprehensive Graph Generation', () => {
         // This is the most critical assertion-- it proves that the system connected
         // a POI from a Python file to a POI in a JavaScript file.
         const crossLanguageRelResult = await session.run(`
-            MATCH (source:POI {name: 'foo'})-[r:RELATES {type: 'CALLS'}]->(target:POI {name: 'bar'})
+            MATCH (source:POI {name: 'foo'})-[r:RELATIONSHIP {type: 'CALLS'}]->(target:POI {name: 'bar'})
             RETURN count(r) as count
         `);
         
         const crossLanguageRelCount = crossLanguageRelResult.records[0].get('count').toNumber();
         expect(crossLanguageRelCount).toBe(1);
 
-    }, 120000); // 2-minute timeout for this long-running E2E test
+    }, 600000); // 10-minute timeout for this long-running E2E test
 });

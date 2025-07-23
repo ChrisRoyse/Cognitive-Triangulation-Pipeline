@@ -21,19 +21,32 @@ class WorkerPoolManager extends EventEmitter {
         // Set environment first
         const environment = options.environment || process.env.NODE_ENV || 'development';
         
+        // HARD LIMIT: Never exceed 150 concurrent agents
+        const ABSOLUTE_MAX_CONCURRENCY = 150;
+        
+        // Get high performance mode flag early
+        const highPerformanceMode = process.env.HIGH_PERFORMANCE_MODE === 'true';
+        
         // Configuration
         this.config = {
             // Environment-specific settings (set first)
             environment,
             
-            // Global concurrency limits
-            maxGlobalConcurrency: options.maxGlobalConcurrency || this.calculateMaxConcurrency(environment),
+            // Global concurrency limits - HARD CAPPED at 150
+            maxGlobalConcurrency: Math.min(
+                options.maxGlobalConcurrency || this.calculateMaxConcurrency(environment),
+                ABSOLUTE_MAX_CONCURRENCY
+            ),
             minWorkerConcurrency: options.minWorkerConcurrency || 1,
-            maxWorkerConcurrency: options.maxWorkerConcurrency || 50,
+            maxWorkerConcurrency: options.maxWorkerConcurrency || 75, // Increased to support 150 agents
             
             // Resource monitoring
-            cpuThreshold: options.cpuThreshold || 80, // CPU % threshold
-            memoryThreshold: options.memoryThreshold || 85, // Memory % threshold
+            cpuThreshold: options.cpuThreshold || parseInt(process.env.CPU_THRESHOLD) || 80, // CPU % threshold
+            memoryThreshold: options.memoryThreshold || parseInt(process.env.MEMORY_THRESHOLD) || 85, // Memory % threshold
+            
+            // High performance mode
+            highPerformanceMode: highPerformanceMode,
+            disableResourceScaling: process.env.DISABLE_RESOURCE_SCALING === 'true',
             
             // Adaptive scaling
             scaleUpFactor: options.scaleUpFactor || 1.5,
@@ -42,11 +55,11 @@ class WorkerPoolManager extends EventEmitter {
             
             // Rate limiting (per worker type) - More permissive for better throughput
             rateLimits: {
-                default: { requests: 15, window: 1000 }, // 15 req/sec default
-                'file-analysis': { requests: 12, window: 1000 }, // More permissive for better throughput
-                'llm-analysis': { requests: 8, window: 1000 }, // Still conservative but not blocking
-                'validation': { requests: 20, window: 1000 }, // Can handle more
-                'graph-ingestion': { requests: 15, window: 1000 },
+                default: { requests: highPerformanceMode ? 30 : 15, window: 1000 }, // Double in high perf mode
+                'file-analysis': { requests: highPerformanceMode ? 25 : 12, window: 1000 }, // Increased for 150 agents
+                'llm-analysis': { requests: highPerformanceMode ? 20 : 8, window: 1000 }, // Increased but still respect API
+                'validation': { requests: highPerformanceMode ? 40 : 20, window: 1000 }, // Can handle more
+                'graph-ingestion': { requests: highPerformanceMode ? 30 : 15, window: 1000 },
                 ...options.rateLimits
             },
             
@@ -95,6 +108,23 @@ class WorkerPoolManager extends EventEmitter {
      * Calculate maximum concurrency based on system resources
      */
     calculateMaxConcurrency(environment) {
+        // HARD LIMIT: Never exceed 150
+        const ABSOLUTE_MAX = 150;
+        
+        // Check for forced override first
+        const forcedConcurrency = process.env.FORCE_MAX_CONCURRENCY;
+        if (forcedConcurrency) {
+            const forced = parseInt(forcedConcurrency);
+            if (!isNaN(forced) && forced > 0) {
+                const capped = Math.min(forced, ABSOLUTE_MAX);
+                if (forced > ABSOLUTE_MAX) {
+                    console.warn(`⚠️  Requested concurrency ${forced} exceeds hard limit of ${ABSOLUTE_MAX}. Using ${ABSOLUTE_MAX}.`);
+                }
+                console.log(`🎯 Using forced max global concurrency: ${capped} (from FORCE_MAX_CONCURRENCY)`);
+                return capped;
+            }
+        }
+        
         const cpuCount = os.cpus().length;
         const totalMemoryGB = os.totalmem() / (1024 * 1024 * 1024);
         
@@ -116,7 +146,7 @@ class WorkerPoolManager extends EventEmitter {
         
         // Higher minimums to prevent blocking
         const minimum = environment === 'test' ? 10 : 15;
-        const result = Math.max(maxConcurrency, minimum);
+        const result = Math.min(Math.max(maxConcurrency, minimum), ABSOLUTE_MAX);
         
         console.log(`🎯 Calculated max global concurrency: ${result} (CPU: ${cpuCount}, Memory: ${totalMemoryGB.toFixed(1)}GB, Environment: ${environment})`);
         return result;
@@ -184,6 +214,13 @@ class WorkerPoolManager extends EventEmitter {
         const worker = this.workers.get(workerType);
         if (!worker) {
             throw new Error(`Worker type '${workerType}' not registered`);
+        }
+        
+        // HARD CHECK: Never exceed 150 concurrent agents
+        if (this.currentConcurrency >= 150) {
+            this.metrics.throttledRequests++;
+            console.error(`🚫 HARD LIMIT: Cannot exceed 150 concurrent agents. Current: ${this.currentConcurrency}`);
+            throw new Error('Maximum concurrent agent limit (150) reached');
         }
         
         // Check global concurrency limit with buffer
@@ -475,6 +512,12 @@ class WorkerPoolManager extends EventEmitter {
      * Handle high resource usage by scaling down
      */
     handleHighResourceUsage(cpuUsage, memoryUsage) {
+        // Skip scaling down if disabled or in high performance mode
+        if (this.config.disableResourceScaling || this.config.highPerformanceMode) {
+            console.log(`⚠️  High resource usage detected (CPU: ${cpuUsage.toFixed(1)}%, Memory: ${memoryUsage.toFixed(1)}%) but scaling is disabled`);
+            return;
+        }
+        
         console.warn(`⚠️  High resource usage detected - CPU: ${cpuUsage.toFixed(1)}%, Memory: ${memoryUsage.toFixed(1)}%`);
         
         // Scale down concurrency for all workers
@@ -498,6 +541,12 @@ class WorkerPoolManager extends EventEmitter {
      * Handle low resource usage by scaling up
      */
     handleLowResourceUsage(cpuUsage, memoryUsage) {
+        // HARD CHECK: Never scale beyond 150 agents
+        if (this.currentConcurrency >= 150 * 0.9) { // 135 agents
+            console.log(`🚫 Near hard limit of 150 agents. Not scaling up.`);
+            return;
+        }
+        
         if (this.currentConcurrency >= this.config.maxGlobalConcurrency * 0.8) {
             return; // Don't scale up if we're near global limit
         }
@@ -507,6 +556,12 @@ class WorkerPoolManager extends EventEmitter {
             .sort((a, b) => b.priority - a.priority);
         
         for (const worker of sortedWorkers) {
+            // HARD CHECK: Stop scaling if approaching 150 limit
+            if (this.currentConcurrency >= 135) { // 90% of 150
+                console.log(`🚫 Stopping scale up - approaching hard limit of 150 agents`);
+                break;
+            }
+            
             if (this.currentConcurrency >= this.config.maxGlobalConcurrency * 0.8) {
                 break;
             }

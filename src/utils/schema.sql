@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS relationship_evidence (
     relationship_id INTEGER NOT NULL,
     run_id TEXT NOT NULL,
     evidence_payload TEXT NOT NULL,
+    relationship_hash TEXT,
     FOREIGN KEY (relationship_id) REFERENCES relationships (id) ON DELETE CASCADE
 );
 

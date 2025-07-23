@@ -34,7 +34,9 @@ class CognitiveTriangulationPipeline {
         // Initialize WorkerPoolManager for intelligent concurrency control
         this.workerPoolManager = new WorkerPoolManager({
             environment: process.env.NODE_ENV || 'development',
-            maxGlobalConcurrency: parseInt(process.env.MAX_GLOBAL_CONCURRENCY) || undefined // Use default calculation
+            maxGlobalConcurrency: parseInt(process.env.FORCE_MAX_CONCURRENCY) || parseInt(process.env.MAX_GLOBAL_CONCURRENCY) || undefined, // Use forced override or default calculation
+            cpuThreshold: parseInt(process.env.CPU_THRESHOLD) || 80,
+            memoryThreshold: parseInt(process.env.MEMORY_THRESHOLD) || 85
         });
         
         this.outboxPublisher = new TransactionalOutboxPublisher(this.dbManager, this.queueManager);

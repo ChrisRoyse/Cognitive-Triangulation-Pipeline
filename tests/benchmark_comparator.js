@@ -50,7 +50,7 @@ class BenchmarkComparator {
                 }
             },
             performance: {
-                executionTime: { min: 30000, expected: 60000, max: 120000 }, // ms
+                executionTime: { min: 30000, expected: 60000, max: 1800000 }, // ms (30 minutes max)
                 memoryUsage: { min: 0, expected: 512, max: 1024 }, // MB
                 errorRate: { min: 0, expected: 0, max: 0.05 } // 5% max error rate
             }

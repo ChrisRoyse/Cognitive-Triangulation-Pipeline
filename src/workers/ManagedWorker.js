@@ -104,8 +104,14 @@ class ManagedWorker extends EventEmitter {
             this.worker = new Worker(this.queueName, this.createManagedProcessor(processingFunction), {
                 connection,
                 concurrency: this.workerInfo.concurrency,
-                removeOnComplete: 100,
-                removeOnFail: 50,
+                removeOnComplete: {
+                    count: 100,
+                    age: 3600 // 1 hour
+                },
+                removeOnFail: {
+                    count: 50,
+                    age: 86400 // 24 hours
+                },
                 settings: {
                     stalledInterval: 30000,
                     maxStalledCount: 1

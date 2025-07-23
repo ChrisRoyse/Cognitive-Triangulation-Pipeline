@@ -96,7 +96,7 @@ describe('End-to-End Pipeline Test with Data Integrity Checks', () => {
             'global-resolution-queue',
             'reconciliation-queue'
         ];
-        await waitForQueuesDrained(queueManager, allQueues, 2400000); // 40 minute timeout
+        await waitForQueuesDrained(queueManager, allQueues, 1800000); // 30 minute timeout
 
         // --- Data Integrity Assertions ---
 
@@ -141,10 +141,10 @@ describe('End-to-End Pipeline Test with Data Integrity Checks', () => {
             { runId }
         );
         expect(specificRelationship.records.length).toBeGreaterThan(0);
-    }, 3000000); // 50 minute test timeout
+    }, 1800000); // 30 minute test timeout
 });
 
-async function waitForQueuesDrained(queueManager, queueNames, timeout = 2400000, interval = 1000) { // Default to 40 minutes
+async function waitForQueuesDrained(queueManager, queueNames, timeout = 1800000, interval = 1000) { // Default to 30 minutes
     const startTime = Date.now();
     console.log(`[TestUtil] Waiting for queues to drain: ${queueNames.join(', ')}`);
 
