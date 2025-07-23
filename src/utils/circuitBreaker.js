@@ -246,6 +246,13 @@ class CircuitBreaker {
         this.setState('CLOSED');
         console.log(`🔄 Circuit breaker '${this.name}' reset`);
     }
+    
+    /**
+     * Get current state
+     */
+    getState() {
+        return this.state;
+    }
 
     /**
      * Get current status

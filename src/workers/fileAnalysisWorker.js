@@ -6,6 +6,7 @@ const LLMResponseSanitizer = require('../utils/LLMResponseSanitizer');
 const { getTokenizer } = require('../utils/tokenizer');
 const { ManagedWorker } = require('./ManagedWorker');
 const { PipelineConfig } = require('../config/pipelineConfig');
+const { getLogger } = require('../config/logging');
 
 const MAX_INPUT_TOKENS = 50000; // Leave a buffer for the prompt template
 const MAX_INPUT_CHARS = 60000; // Character limit to stay well within DeepSeek's 64K token limit
@@ -24,6 +25,9 @@ class FileAnalysisWorker {
         this.config = options.pipelineConfig || PipelineConfig.createDefault();
         const workerLimit = this.config.getWorkerLimit('file-analysis');
         const apiRateLimit = this.config.performance.apiRateLimit;
+        
+        // Initialize logger
+        this.logger = getLogger('FileAnalysisWorker');
 
         if (!options.processOnly) {
             if (workerPoolManager) {
@@ -43,7 +47,11 @@ class FileAnalysisWorker {
                     ...options
                 });
                 
-                console.log(`✅ FileAnalysisWorker configured: ${workerLimit} max concurrency, ${this.managedWorker.options.rateLimitRequests} req/s`);
+                this.logger.info('FileAnalysisWorker configured', {
+                    maxConcurrency: workerLimit,
+                    rateLimitRequests: this.managedWorker.options.rateLimitRequests,
+                    baseConcurrency: this.managedWorker.options.baseConcurrency
+                });
                 
                 // Initialize the managed worker
                 this.initializeWorker();
@@ -54,7 +62,9 @@ class FileAnalysisWorker {
                     concurrency: options.concurrency || Math.min(3, workerLimit)
                 });
                 
-                console.log(`✅ FileAnalysisWorker (basic) configured: ${this.worker.opts.concurrency} concurrency`);
+                this.logger.info('FileAnalysisWorker (basic) configured', {
+                    concurrency: this.worker.opts.concurrency
+                });
             }
         }
     }
@@ -68,19 +78,34 @@ class FileAnalysisWorker {
             
             // Setup event handlers
             this.managedWorker.on('jobCompleted', (event) => {
-                console.log(`✅ [FileAnalysisWorker] Job ${event.jobId} completed in ${event.processingTime}ms`);
+                this.logger.info('Job completed', {
+                    eventType: 'queue-event',
+                    queueName: 'file-analysis-queue',
+                    jobId: event.jobId,
+                    processingTime: event.processingTime
+                });
             });
             
             this.managedWorker.on('jobFailed', (event) => {
-                console.error(`❌ [FileAnalysisWorker] Job ${event.jobId} failed: ${event.error}`);
+                this.logger.error('Job failed', {
+                    error: event.error,
+                    jobId: event.jobId,
+                    queueName: 'file-analysis-queue'
+                });
             });
             
             this.managedWorker.on('concurrencyChanged', (event) => {
-                console.log(`🔄 [FileAnalysisWorker] Concurrency changed: ${event.oldConcurrency} → ${event.newConcurrency} (${event.reason})`);
+                this.logger.info('Worker pool concurrency changed', {
+                    eventType: 'worker-pool-event',
+                    workerType: 'file-analysis',
+                    newConcurrency: event.newConcurrency,
+                    oldConcurrency: event.oldConcurrency,
+                    reason: event.reason
+                });
             });
             
         } catch (error) {
-            console.error('❌ Failed to initialize FileAnalysisWorker:', error);
+            this.logger.error('Failed to initialize FileAnalysisWorker', { error });
             throw error;
         }
     }
@@ -98,17 +123,33 @@ class FileAnalysisWorker {
         if (!filePath) {
             throw new Error("Cannot destructure property 'filePath' of 'job.data' as it is undefined.");
         }
-        console.log(`[FileAnalysisWorker] Processing job ${job.id} for file: ${filePath}`);
+        
+        // Create performance logger for this job
+        const { createPerformanceLogger } = require('../config/logging');
+        const perfLogger = createPerformanceLogger(`file-analysis-${jobId || job.id}`, this.logger);
+        perfLogger.start();
+        
+        jobLogger.info('Processing file analysis job', {
+            filePath,
+            runId,
+            jobId: job.id
+        });
 
         try {
             // Check cache first to avoid redundant API calls
+            const cacheTimer = jobLogger.startTimer('cache-check', jobId);
             const cacheKey = `file-analysis:${path.basename(filePath)}:${await this.getFileHash(filePath)}`;
             const cachedResult = await this.cacheClient.get(cacheKey);
+            cacheTimer.end('Cache check completed');
             
             if (cachedResult) {
-                console.log(`💾 [FileAnalysisWorker] Cache hit for ${filePath}`);
+                jobLogger.info('Cache hit for file analysis', {
+                    filePath,
+                    cacheKey
+                });
                 const pois = JSON.parse(cachedResult);
-                await this.storeFindingsAndTriggerAggregation(pois, filePath, runId, jobId);
+                await this.storeFindingsAndTriggerAggregation(pois, filePath, runId, jobId, jobLogger);
+                perfLogger.end({ cached: true, poisCount: pois.length, message: 'File analysis completed (cached)' });
                 return pois;
             }
             let content = await fs.readFile(filePath, 'utf-8');
@@ -116,7 +157,11 @@ class FileAnalysisWorker {
 
             // Use character-based chunking to stay within DeepSeek's limits
             if (charCount > MAX_INPUT_CHARS) {
-                console.warn(`[FileAnalysisWorker] File ${filePath} exceeds character limit (${charCount} > ${MAX_INPUT_CHARS}). Truncating content.`);
+                jobLogger.warn('File exceeds character limit, truncating', {
+                    filePath,
+                    originalCharCount: charCount,
+                    maxChars: MAX_INPUT_CHARS
+                });
                 // Truncate from the middle to preserve start and end
                 const halfLimit = Math.floor(MAX_INPUT_CHARS / 2);
                 const start = content.substring(0, halfLimit);
@@ -125,12 +170,16 @@ class FileAnalysisWorker {
                 
                 // Log estimated tokens for monitoring
                 const estimatedTokens = this.tokenizer(content);
-                console.log(`[FileAnalysisWorker] Truncated content to ${content.length} chars (~${estimatedTokens} tokens)`);
+                jobLogger.info('Content truncated', {
+                    truncatedLength: content.length,
+                    estimatedTokens
+                });
             }
 
             const prompt = this.constructPrompt(filePath, content);
             
             // Use WorkerPoolManager if available for intelligent retry and circuit breaking
+            const apiTimer = jobLogger.startTimer('llm-api-call', jobId);
             const llmResponse = this.workerPoolManager
                 ? await this.workerPoolManager.executeWithManagement(
                     'file-analysis',
@@ -138,6 +187,12 @@ class FileAnalysisWorker {
                     { filePath, contentLength: content.length }
                   )
                 : await this.llmClient.query(prompt);
+            const apiMetrics = apiTimer.end('LLM API call completed');
+            
+            jobLogger.logApiCall('POST', 'deepseek/analyze', 200, apiMetrics.duration, {
+                contentLength: content.length,
+                promptTokens: this.tokenizer(prompt)
+            });
             
             const pois = this.parseResponse(llmResponse);
             
@@ -146,12 +201,33 @@ class FileAnalysisWorker {
                 await this.cacheClient.setex(cacheKey, 3600, JSON.stringify(pois)); // Cache for 1 hour
             }
 
-            await this.storeFindingsAndTriggerAggregation(pois, filePath, runId, jobId);
+            await this.storeFindingsAndTriggerAggregation(pois, filePath, runId, jobId, jobLogger);
+            
+            const metrics = perfLogger.end({
+                poisCount: pois.length,
+                cached: false
+            });
+            
+            // Log performance metrics
+            jobLogger.logMetrics({
+                fileAnalysis: {
+                    duration: metrics.duration,
+                    memoryUsage: metrics.memoryUsage,
+                    cpuUsage: metrics.cpuUsage,
+                    poisCount: pois.length,
+                    fileSize: charCount
+                }
+            });
             
             return pois;
 
         } catch (error) {
-            console.error(`[FileAnalysisWorker] Error processing job ${job.id} for file ${filePath}:`, error);
+            perfLogger.end({ success: false, error: error.message });
+            jobLogger.error('Error processing file analysis job', error, {
+                filePath,
+                runId,
+                jobId: job.id
+            });
             
             // Add contextual information to error for better debugging
             error.context = {
@@ -180,7 +256,8 @@ class FileAnalysisWorker {
     /**
      * Store findings and trigger directory aggregation
      */
-    async storeFindingsAndTriggerAggregation(pois, filePath, runId, jobId) {
+    async storeFindingsAndTriggerAggregation(pois, filePath, runId, jobId, logger = null) {
+        const jobLogger = logger || this.logger;
         if (pois.length > 0) {
             const findingPayload = {
                 type: 'file-analysis-finding',
@@ -190,17 +267,30 @@ class FileAnalysisWorker {
                 filePath: filePath,
                 pois: pois,
             };
+            const dbTimer = jobLogger.startTimer('database-insert', jobId);
             const db = this.dbManager.getDb();
             const stmt = db.prepare('INSERT INTO outbox (run_id, event_type, payload, status) VALUES (?, ?, ?, ?)');
-            stmt.run(runId, findingPayload.type, JSON.stringify(findingPayload), 'PENDING');
+            const result = stmt.run(runId, findingPayload.type, JSON.stringify(findingPayload), 'PENDING');
+            const dbMetrics = dbTimer.end('Database insert completed');
+            
+            jobLogger.logDatabaseOperation('INSERT', 'outbox', dbMetrics.duration, result.changes, {
+                runId,
+                eventType: findingPayload.type
+            });
         }
 
         // Trigger directory aggregation
         const directoryPath = path.dirname(filePath);
-        await this.directoryAggregationQueue.add('aggregate-directory', {
+        const aggregationJob = await this.directoryAggregationQueue.add('aggregate-directory', {
             directoryPath,
             runId,
             fileJobId: jobId,
+        });
+        
+        jobLogger.info('Directory aggregation job enqueued', {
+            directoryPath,
+            aggregationJobId: aggregationJob.id,
+            parentJobId: jobId
         });
     }
     constructPrompt(filePath, fileContent) {
@@ -233,8 +323,11 @@ class FileAnalysisWorker {
             });
             return pois;
         } catch (error) {
-            console.error('Failed to parse LLM response for file analysis:', error);
-            console.error('Original response:', response);
+            this.logger.error('Failed to parse LLM response', {
+                error,
+                responseLength: response?.length,
+                responsePreview: response?.substring(0, 200)
+            });
             return [];
         }
     }

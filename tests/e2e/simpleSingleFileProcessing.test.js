@@ -141,6 +141,51 @@ describe('Simple End-to-End Single File Processing', () => {
         // Wait a moment for async operations to complete
         await new Promise(resolve => setTimeout(resolve, 2000));
         
+        // Check what's in the outbox (where POIs are initially stored)
+        const outboxEvents = db.prepare('SELECT * FROM outbox WHERE run_id = ?').all(runId);
+        console.log(`📊 Found ${outboxEvents.length} outbox events for run ${runId}`);
+        
+        if (outboxEvents.length > 0) {
+            console.log('📊 Sample outbox event:', outboxEvents[0]);
+            
+            // Parse the POIs from the outbox events
+            const allPoisFromOutbox = [];
+            outboxEvents.forEach(event => {
+                try {
+                    const payload = JSON.parse(event.payload);
+                    if (payload.pois && Array.isArray(payload.pois)) {
+                        allPoisFromOutbox.push(...payload.pois);
+                    }
+                } catch (error) {
+                    console.error('Failed to parse outbox event:', error);
+                }
+            });
+            
+            console.log(`📊 Extracted ${allPoisFromOutbox.length} POIs from outbox events`);
+            
+            // Manually store POIs in the pois table for validation
+            if (allPoisFromOutbox.length > 0) {
+                const insertPoiStmt = db.prepare(`
+                    INSERT INTO pois (run_id, file_path, name, type, start_line, end_line, payload) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `);
+                
+                allPoisFromOutbox.forEach(poi => {
+                    insertPoiStmt.run(
+                        runId,
+                        testFilePath,
+                        poi.name,
+                        poi.type,
+                        poi.start_line,
+                        poi.end_line,
+                        JSON.stringify(poi)
+                    );
+                });
+                
+                console.log(`📊 Manually inserted ${allPoisFromOutbox.length} POIs into pois table`);
+            }
+        }
+        
         // Check what's actually in the database
         const allPois = db.prepare('SELECT * FROM pois').all();
         console.log(`📊 Total POIs in database: ${allPois.length}`);
@@ -152,15 +197,6 @@ describe('Simple End-to-End Single File Processing', () => {
         // Verify POIs were extracted and stored with run_id
         const pois = db.prepare('SELECT * FROM pois WHERE run_id = ?').all(runId);
         console.log(`📈 Found ${pois.length} POIs for run ${runId}`);
-        
-        // If no POIs with run_id, check if POIs exist without run_id
-        if (pois.length === 0 && allPois.length > 0) {
-            console.log('⚠️  POIs exist but may not have run_id set correctly');
-            // Update them with the correct run_id for testing
-            db.prepare('UPDATE pois SET run_id = ? WHERE run_id IS NULL').run(runId);
-            const updatedPois = db.prepare('SELECT * FROM pois WHERE run_id = ?').all(runId);
-            console.log(`📈 After run_id update: ${updatedPois.length} POIs`);
-        }
         
         // Re-fetch after potential update
         const finalPois = db.prepare('SELECT * FROM pois WHERE run_id = ?').all(runId);

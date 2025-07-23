@@ -27,7 +27,10 @@
     "test:benchmark:master": "jest tests/benchmark/masterBenchmark.test.js --timeout=2100000",
     "test:benchmark:analysis": "node tests/benchmark/runBenchmarkAnalysis.js",
     "benchmark": "npm run test:benchmark:master",
-    "benchmark:analysis": "npm run test:benchmark:analysis"
+    "benchmark:analysis": "npm run test:benchmark:analysis",
+    "test:smoke": "node tests/smoke/runSmokeTests.js",
+    "smoke": "npm run test:smoke",
+    "predeploy": "node tests/smoke/preDeploymentCheck.js"
   },
   "dependencies": {
     "ajv": "^8.17.1",

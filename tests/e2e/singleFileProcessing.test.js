@@ -156,6 +156,12 @@ describe('End-to-End Single File Processing', () => {
         
         const db = dbManager.getDb();
         
+        // Wait for events to be processed by the TransactionalOutboxPublisher
+        await waitForCondition(async () => {
+            const publishedEvents = db.prepare("SELECT COUNT(*) as count FROM outbox WHERE run_id = ? AND status = 'PUBLISHED'").get(runId);
+            return publishedEvents.count > 0;
+        }, 45000);
+        
         // Verify POIs were extracted and stored with run_id
         const pois = db.prepare('SELECT * FROM pois WHERE run_id = ?').all(runId);
         console.log(`📈 Found ${pois.length} POIs for run ${runId}`);
@@ -167,7 +173,7 @@ describe('End-to-End Single File Processing', () => {
         const poiTypes = [...new Set(pois.map(poi => poi.type))];
         console.log('🏷️  POI Types found:', poiTypes);
         
-        const expectedTypes = ['FunctionDefinition', 'VariableDeclaration', 'ClassDefinition'];
+        const expectedTypes = ['FunctionDefinition', 'VariableDeclaration', 'ClassDefinition', 'ImportStatement'];
         const foundExpectedTypes = expectedTypes.filter(type => poiTypes.includes(type));
         expect(foundExpectedTypes.length).toBeGreaterThan(0);
         

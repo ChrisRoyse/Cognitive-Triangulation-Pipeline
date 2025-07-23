@@ -90,6 +90,10 @@ class WorkerPoolManager extends EventEmitter {
             lastResourceCheck: Date.now()
         };
         
+        // Integration points
+        this.globalConcurrencyManager = null;
+        this.circuitBreakerManager = null;
+        
         // Resource monitoring
         this.resourceMonitor = null;
         this.lastCpuUsage = process.cpuUsage();
@@ -216,6 +220,31 @@ class WorkerPoolManager extends EventEmitter {
             throw new Error(`Worker type '${workerType}' not registered`);
         }
         
+        // Use global concurrency manager if available
+        if (this.globalConcurrencyManager) {
+            // Global manager handles all concurrency limits
+            const permit = await this.globalConcurrencyManager.acquire(workerType, {
+                timeout: jobData.timeout || 30000
+            });
+            
+            // Store permit for tracking
+            worker.globalPermit = permit;
+            worker.activeJobs++;
+            this.currentConcurrency++;
+            this.metrics.activeRequests++;
+            this.metrics.totalRequests++;
+            worker.lastActivity = Date.now();
+            
+            return {
+                workerType,
+                slotId: permit.id,
+                concurrency: worker.concurrency,
+                priority: worker.priority,
+                globalPermit: permit
+            };
+        }
+        
+        // Fallback to local management
         // HARD CHECK: Never exceed 150 concurrent agents
         if (this.currentConcurrency >= 150) {
             this.metrics.throttledRequests++;
@@ -274,11 +303,20 @@ class WorkerPoolManager extends EventEmitter {
     /**
      * Release a job slot
      */
-    releaseJobSlot(workerType, success = true, processingTime = 0) {
+    async releaseJobSlot(workerType, success = true, processingTime = 0, slotInfo = {}) {
         const worker = this.workers.get(workerType);
         if (!worker) {
             console.warn(`⚠️  Attempted to release slot for unknown worker: ${workerType}`);
             return;
+        }
+        
+        // Release global permit if using global manager
+        if (this.globalConcurrencyManager && slotInfo.globalPermit) {
+            await this.globalConcurrencyManager.release(slotInfo.globalPermit.id);
+        } else if (worker.globalPermit) {
+            // Fallback if permit stored on worker
+            await this.globalConcurrencyManager.release(worker.globalPermit.id);
+            worker.globalPermit = null;
         }
         
         // Update counters
@@ -310,13 +348,28 @@ class WorkerPoolManager extends EventEmitter {
             // Request slot
             slot = await this.requestJobSlot(workerType, jobData);
             
-            // Execute with circuit breaker protection
+            // Execute with circuit breaker protection if available
             const worker = this.workers.get(workerType);
-            const result = await worker.circuitBreaker.execute(operation);
+            let result;
+            
+            if (this.circuitBreakerManager) {
+                // Use circuit breaker manager
+                result = await this.circuitBreakerManager.executeWithBreaker(
+                    workerType,
+                    operation,
+                    jobData
+                );
+            } else if (worker.circuitBreaker) {
+                // Use worker's circuit breaker
+                result = await worker.circuitBreaker.execute(operation);
+            } else {
+                // Direct execution
+                result = await operation();
+            }
             
             // Success
             const processingTime = Date.now() - startTime;
-            this.releaseJobSlot(workerType, true, processingTime);
+            await this.releaseJobSlot(workerType, true, processingTime, slot);
             
             return result;
             
@@ -324,7 +377,7 @@ class WorkerPoolManager extends EventEmitter {
             // Failure
             const processingTime = Date.now() - startTime;
             if (slot) {
-                this.releaseJobSlot(workerType, false, processingTime);
+                await this.releaseJobSlot(workerType, false, processingTime, slot);
             }
             
             throw error;
@@ -814,6 +867,94 @@ class WorkerPoolManager extends EventEmitter {
         console.log(`   Memory Threshold: ${this.config.memoryThreshold}%`);
         console.log(`   Rate Limits: ${Object.keys(this.config.rateLimits).length} configured`);
         console.log(`   Worker Priorities: ${Object.keys(this.config.workerPriorities).length} configured`);
+    }
+    
+    /**
+     * Set global concurrency manager
+     */
+    setGlobalConcurrencyManager(manager) {
+        this.globalConcurrencyManager = manager;
+        console.log('🔗 Global concurrency manager integrated');
+    }
+    
+    /**
+     * Set circuit breaker manager
+     */
+    setCircuitBreakerManager(manager) {
+        this.circuitBreakerManager = manager;
+        console.log('🔗 Circuit breaker manager integrated');
+        
+        // Subscribe to circuit breaker events
+        if (manager) {
+            manager.on('stateChange', ({ serviceName, oldState, newState }) => {
+                this.handleCircuitBreakerStateChange(serviceName, oldState, newState);
+            });
+            
+            manager.on('protectiveMode', ({ activated }) => {
+                if (activated) {
+                    console.warn('🛡️  Entering protective mode - reducing concurrency');
+                    this.reduceAllWorkerConcurrency(0.5);
+                } else {
+                    console.log('✅ Exiting protective mode - restoring concurrency');
+                    this.restoreWorkerConcurrency();
+                }
+            });
+        }
+    }
+    
+    /**
+     * Get adjusted concurrency based on circuit breaker state
+     */
+    getAdjustedConcurrency(workerType) {
+        const worker = this.workers.get(workerType);
+        if (!worker) return this.config.minWorkerConcurrency;
+        
+        let concurrency = worker.concurrency;
+        
+        // Reduce if circuit breaker manager indicates issues
+        if (this.circuitBreakerManager && this.circuitBreakerManager.isInProtectiveMode()) {
+            concurrency = Math.floor(concurrency * 0.5);
+        }
+        
+        return Math.max(this.config.minWorkerConcurrency, concurrency);
+    }
+    
+    /**
+     * Check if in protective mode
+     */
+    isInProtectiveMode() {
+        return this.circuitBreakerManager && this.circuitBreakerManager.isInProtectiveMode();
+    }
+    
+    /**
+     * Reduce all worker concurrency
+     */
+    reduceAllWorkerConcurrency(factor = 0.5) {
+        for (const worker of this.workers.values()) {
+            const originalConcurrency = worker.concurrency;
+            worker.concurrency = Math.max(
+                worker.minConcurrency,
+                Math.floor(worker.concurrency * factor)
+            );
+            
+            if (worker.concurrency < originalConcurrency) {
+                console.log(`📉 Reduced ${worker.type} concurrency: ${originalConcurrency} → ${worker.concurrency}`);
+            }
+        }
+    }
+    
+    /**
+     * Restore worker concurrency to normal levels
+     */
+    restoreWorkerConcurrency() {
+        for (const worker of this.workers.values()) {
+            const targetConcurrency = this.calculateInitialConcurrency(worker.type, worker.priority);
+            
+            if (targetConcurrency > worker.concurrency) {
+                worker.concurrency = targetConcurrency;
+                console.log(`📈 Restored ${worker.type} concurrency to ${worker.concurrency}`);
+            }
+        }
     }
 }
 

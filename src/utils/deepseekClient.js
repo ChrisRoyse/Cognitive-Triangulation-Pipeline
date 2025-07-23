@@ -2,6 +2,7 @@ const https = require('https');
 require('dotenv').config();
 const config = require('../config');
 const { getCacheManager } = require('./cacheManager');
+const { getLogger } = require('../config/logging');
 
 /**
  * Pure DeepSeek LLM Client
@@ -19,8 +20,13 @@ class DeepSeekClient {
         
         this._apiKey = null;
         this.cacheManager = getCacheManager();
+        this.logger = getLogger('DeepSeekClient');
         
-        console.log('[DeepSeekClient] Initialized with caching support');
+        this.logger.info('DeepSeekClient initialized with caching support', {
+            baseURL: this.baseURL,
+            timeout: this.timeout,
+            maxConcurrentRequests: this.maxConcurrentRequests
+        });
     }
 
     get apiKey() {
@@ -29,7 +35,7 @@ class DeepSeekClient {
             if (!this._apiKey) {
                 throw new Error('DEEPSEEK_API_KEY environment variable is required');
             }
-            console.log('✅ DeepSeek Client initialized successfully');
+            this.logger.info('DeepSeek API key loaded successfully');
         }
         return this._apiKey;
     }
@@ -60,12 +66,14 @@ class DeepSeekClient {
             // Check cache first
             const cachedResponse = await this.cacheManager.get(promptContent, options);
             if (cachedResponse) {
-                console.log('[DeepSeekClient] Cache hit - returning cached response');
+                this.logger.info('Cache hit - returning cached response', {
+                    cacheKey: cacheKey.substring(0, 20) + '...'
+                });
                 return cachedResponse;
             }
 
             // Cache miss - make API call
-            console.log('[DeepSeekClient] Cache miss - making API call');
+            this.logger.debug('Cache miss - making API call');
             const response = await this._scheduleRequest('/chat/completions', 'POST', requestBody);
             
             const result = {
@@ -79,7 +87,7 @@ class DeepSeekClient {
             
             return result;
         } catch (error) {
-            console.error('DeepSeek API call failed after retries:', error.message);
+            this.logger.error('DeepSeek API call failed after retries', error);
             throw new Error(`DeepSeek API call failed: ${error.message}`);
         }
     }
@@ -116,12 +124,12 @@ class DeepSeekClient {
             // Check cache first
             const cachedResponse = await this.cacheManager.get(promptContent, cacheOpts);
             if (cachedResponse) {
-                console.log('[DeepSeekClient] createChatCompletion cache hit');
+                this.logger.info('createChatCompletion cache hit');
                 return cachedResponse;
             }
 
             // Cache miss - make API call
-            console.log('[DeepSeekClient] createChatCompletion cache miss - making API call');
+            this.logger.debug('createChatCompletion cache miss - making API call');
             const response = await this._scheduleRequest('/chat/completions', 'POST', requestBody);
 
             // Store in cache
@@ -129,14 +137,17 @@ class DeepSeekClient {
 
             return response;
         } catch (error) {
-            console.error('[DeepSeekClient] createChatCompletion failed after all retries:', error.message);
+            this.logger.error('createChatCompletion failed after all retries', error);
             throw error;
         }
     }
 
     _scheduleRequest(endpoint, method, body) {
         return new Promise((resolve, reject) => {
-            console.log(`[DeepSeekClient] Scheduling request. Active: ${this.activeRequests}, Queued: ${this.requestQueue.length}`);
+            this.logger.debug('Scheduling request', {
+                activeRequests: this.activeRequests,
+                queuedRequests: this.requestQueue.length
+            });
             this.requestQueue.push({ endpoint, method, body, resolve, reject });
             this._processQueue();
         });
@@ -150,14 +161,18 @@ class DeepSeekClient {
         this.activeRequests++;
         const { endpoint, method, body, resolve, reject } = this.requestQueue.shift();
         
-        console.log(`[DeepSeekClient] Starting request. Active: ${this.activeRequests}`);
+        this.logger.debug('Starting request', {
+            activeRequests: this.activeRequests
+        });
 
         this._makeRequestWithRetry(endpoint, method, body)
             .then(resolve)
             .catch(reject)
             .finally(() => {
                 this.activeRequests--;
-                console.log(`[DeepSeekClient] Finished request. Active: ${this.activeRequests}`);
+                this.logger.debug('Finished request', {
+                    activeRequests: this.activeRequests
+                });
                 this._processQueue();
             });
     }
@@ -172,13 +187,23 @@ class DeepSeekClient {
                 const response = await this._makeRequest(endpoint, method, body);
                 return response;
             } catch (error) {
-                console.error(`[DeepSeekClient] Request attempt ${i + 1} FAILED. Error: ${error.message}`, { code: error.code, status: error.status });
+                this.logger.error('Request attempt failed', error, {
+                    attempt: i + 1,
+                    code: error.code,
+                    status: error.status
+                });
                 if (this._isRetryableError(error) && i < retries - 1) {
                     const backoffDelay = delay * Math.pow(2, i);
-                    console.warn(`[DeepSeekClient] Retrying in ${backoffDelay}ms...`);
+                    this.logger.warn('Retrying request', {
+                        backoffDelay,
+                        nextAttempt: i + 2
+                    });
                     await new Promise(resolve => setTimeout(resolve, backoffDelay));
                 } else {
-                    console.error(`[DeepSeekClient] FINAL request failure after ${i + 1} attempts.`, { endpoint, error: error.message });
+                    this.logger.error('FINAL request failure after all attempts', error, {
+                        endpoint,
+                        totalAttempts: i + 1
+                    });
                     throw error;
                 }
             }
@@ -243,7 +268,7 @@ class DeepSeekClient {
             const response = await this.call(testPrompt, { ttl: 60 }); // Short TTL for test
             return response.body.includes('Connection successful');
         } catch (error) {
-            console.error('DeepSeek connection test failed:', error.message);
+            this.logger.error('DeepSeek connection test failed', error);
             return false;
         }
     }

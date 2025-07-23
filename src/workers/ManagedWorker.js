@@ -7,6 +7,7 @@
 
 const { Worker } = require('bullmq');
 const { EventEmitter } = require('events');
+const { getLogger } = require('../config/logging');
 
 class ManagedWorker extends EventEmitter {
     constructor(queueName, workerPoolManager, options = {}) {
@@ -19,6 +20,9 @@ class ManagedWorker extends EventEmitter {
         this.queueName = queueName;
         this.workerPoolManager = workerPoolManager;
         this.workerType = options.workerType || queueName.replace('-queue', '');
+        
+        // Initialize logger
+        this.logger = getLogger('ManagedWorker', { workerType: this.workerType });
         
         // Configuration
         this.config = {
@@ -78,7 +82,11 @@ class ManagedWorker extends EventEmitter {
         this.healthCheckTimer = null;
         this.metricsTimer = null;
         
-        console.log(`🔧 ManagedWorker '${this.workerType}' created (ID: ${this.config.workerId})`);
+        this.logger.info('ManagedWorker created', {
+            workerId: this.config.workerId,
+            baseConcurrency: this.config.baseConcurrency,
+            maxConcurrency: this.config.maxConcurrency
+        });
     }
 
     /**
@@ -332,7 +340,10 @@ class ManagedWorker extends EventEmitter {
      */
     handleConcurrencyChange(newConcurrency, reason) {
         if (this.worker && this.worker.opts.concurrency !== newConcurrency) {
-            console.log(`🔄 [${this.workerType}] Concurrency changed: ${this.worker.opts.concurrency} → ${newConcurrency} (${reason})`);
+            this.logger.logWorkerPoolEvent('concurrency-changed', this.workerType, newConcurrency, {
+                oldConcurrency: this.worker.opts.concurrency,
+                reason
+            });
             
             // BullMQ doesn't support dynamic concurrency changes, so we log it
             // In a production system, you might restart the worker with new concurrency

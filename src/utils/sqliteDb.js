@@ -2,6 +2,7 @@ const Database = require('better-sqlite3');
 const fs = require('fs');
 const path = require('path');
 const { MigrationManager } = require('./migrationManager');
+const { getLogger } = require('../config/logging');
 
 /**
  * Manages a connection to a SQLite database.
@@ -18,6 +19,7 @@ class DatabaseManager {
         }
         this.dbPath = dbPath;
         this.db = null;
+        this.logger = getLogger('DatabaseManager');
     }
 
     /**
@@ -66,7 +68,7 @@ class DatabaseManager {
             const migrationManager = new MigrationManager(this.getDb());
             await migrationManager.runPendingMigrations();
         } catch (error) {
-            console.error('❌ Database migration failed:', error.message);
+            this.logger.error('Database migration failed', error);
             throw error;
         }
     }

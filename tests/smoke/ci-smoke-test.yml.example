@@ -1,0 +1,93 @@
+# Example GitHub Actions workflow for running smoke tests
+# Copy this to .github/workflows/smoke-test.yml
+
+name: Smoke Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Enforce 5-minute timeout
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      neo4j:
+        image: neo4j:5-community
+        ports:
+          - 7474:7474
+          - 7687:7687
+        env:
+          NEO4J_AUTH: neo4j/test1234
+          NEO4J_ACCEPT_LICENSE_AGREEMENT: yes
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p test1234 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Create test environment
+      run: |
+        mkdir -p data logs
+        cp .env.example .env
+        # Update .env with test values
+        sed -i 's/DEEPSEEK_API_KEY=.*/DEEPSEEK_API_KEY=${{ secrets.DEEPSEEK_API_KEY }}/' .env
+        sed -i 's/NEO4J_PASSWORD=.*/NEO4J_PASSWORD=test1234/' .env
+    
+    - name: Initialize database
+      run: npm run init-db
+    
+    - name: Run smoke tests
+      run: npm run test:smoke
+      env:
+        NODE_ENV: test
+        REDIS_URL: redis://localhost:6379
+        NEO4J_URI: bolt://localhost:7687
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: smoke-test-results
+        path: |
+          logs/
+          test-results/
+        retention-days: 7
+    
+    - name: Notify on failure
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: '❌ Smoke tests failed! Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.'
+          })

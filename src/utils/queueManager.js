@@ -3,6 +3,7 @@ const IORedis = require('ioredis');
 const config = require('../../config/index.js');
 const { QueueCleanupManager } = require('./queueCleanupManager.js');
 const { PipelineConfig } = require('../config/pipelineConfig.js');
+const { getLogger } = require('../config/logging.js');
 
 const FAILED_JOBS_QUEUE_NAME = 'failed-jobs';
 
@@ -24,6 +25,9 @@ class QueueManager {
     this.isConnected = false;
     this.cleanupManager = null;
     this.pipelineConfig = null;
+    
+    // Initialize logger
+    this.logger = getLogger('QueueManager');
 
     this.connection = new IORedis(config.REDIS_URL, {
       maxRetriesPerRequest: null,
@@ -32,18 +36,20 @@ class QueueManager {
 
     this.connection.on('connect', () => {
       this.isConnected = true;
-      console.log('Successfully connected to Redis.');
+      this.logger.info('Successfully connected to Redis', {
+        url: config.REDIS_URL.replace(/:[^:@]+@/, ':***@') // Mask password in URL
+      });
       this._initializeCleanupManager();
     });
 
     this.connection.on('error', (err) => {
-      console.error('Redis Client Error:', err);
+      this.logger.error('Redis Client Error', err);
       this.isConnected = false;
     });
 
     this.connection.on('end', () => {
       this.isConnected = false;
-      console.log('Redis connection closed.');
+      this.logger.info('Redis connection closed');
     });
   }
 
@@ -189,12 +195,12 @@ class QueueManager {
 
       // Start the cleanup manager automatically
       this.cleanupManager.start().catch(error => {
-        console.error('❌ Failed to start cleanup manager:', error);
+        this.logger.error('Failed to start cleanup manager', error);
       });
 
-      console.log('✅ Queue cleanup manager initialized and started');
+      this.logger.info('Queue cleanup manager initialized and started');
     } catch (error) {
-      console.error('❌ Failed to initialize cleanup manager:', error);
+      this.logger.error('Failed to initialize cleanup manager', error);
     }
   }
 
