@@ -70,7 +70,14 @@ class TransactionalOutboxPublisher {
 
         const poiEvents = events.filter(e => e.event_type === 'file-analysis-finding');
         const relationshipEvents = events.filter(e => e.event_type === 'relationship-analysis-finding');
-        const otherEvents = events.filter(e => e.event_type !== 'file-analysis-finding' && e.event_type !== 'relationship-analysis-finding');
+        const globalRelationshipEvents = events.filter(e => e.event_type === 'global-relationship-analysis-finding');
+        const directoryEvents = events.filter(e => e.event_type === 'directory-analysis-finding');
+        const otherEvents = events.filter(e => 
+            e.event_type !== 'file-analysis-finding' && 
+            e.event_type !== 'relationship-analysis-finding' &&
+            e.event_type !== 'global-relationship-analysis-finding' &&
+            e.event_type !== 'directory-analysis-finding'
+        );
 
         // Process POI events FIRST to populate the database
         const statusUpdates = [];
@@ -85,13 +92,32 @@ class TransactionalOutboxPublisher {
             }
         }
         
-        // Force flush POI inserts before processing relationships
+        // Force flush POI inserts before processing other events
         await this.batchWriter.flush();
+        
+        // Process directory events after POI events
+        for (const event of directoryEvents) {
+            try {
+                await this._handleDirectoryAnalysisFinding(event);
+                statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
+            } catch (error) {
+                console.error(`[TransactionalOutboxPublisher] Failed to publish directory event ${event.id}:`, error);
+                statusUpdates.push({ id: event.id, status: 'FAILED' });
+            }
+        }
         
         // Process relationship events AFTER POIs are in database
         if (relationshipEvents.length > 0) {
             await this._handleBatchedRelationshipFindings(relationshipEvents);
         }
+        
+        // Process global relationship events AFTER intra-file relationships
+        if (globalRelationshipEvents.length > 0) {
+            await this._handleBatchedGlobalRelationshipFindings(globalRelationshipEvents);
+        }
+        
+        // Check if we should trigger global cross-file analysis
+        await this._checkAndTriggerGlobalAnalysis();
         
         // Process any other events
         for (const event of otherEvents) {
@@ -115,6 +141,8 @@ class TransactionalOutboxPublisher {
         // Batch process all status updates
         if (statusUpdates.length > 0) {
             this.batchWriter.addOutboxUpdatesBatch(statusUpdates);
+            // Flush status updates to mark events as processed
+            await this.batchWriter.flush();
         }
         this.isPolling = false;
     }
@@ -128,29 +156,92 @@ class TransactionalOutboxPublisher {
             
             // Write POIs directly to database using batch writer
             for (const poi of pois) {
-                // Generate a unique hash for each POI
-                const hash = crypto.createHash('md5');
-                hash.update(filePath);
-                hash.update(poi.name);
-                hash.update(poi.type);
-                hash.update(String(poi.startLine || poi.start_line || 0));
-                const poiHash = hash.digest('hex');
-                
-                this.batchWriter.addPoiInsert({
-                    filePath: filePath,
-                    name: poi.name,
-                    type: poi.type,
-                    startLine: poi.startLine || poi.start_line,
-                    endLine: poi.endLine || poi.end_line,
-                    llmOutput: JSON.stringify(poi),
-                    hash: poiHash,
-                    runId: runId
-                });
+                try {
+                    // Validate required POI fields
+                    if (!poi.name || typeof poi.name !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid POI missing name, skipping:`, poi);
+                        continue;
+                    }
+                    
+                    if (!poi.type || typeof poi.type !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid POI missing type, skipping:`, poi);
+                        continue;
+                    }
+
+                    // Validate and provide defaults for new required fields
+                    let description = poi.description;
+                    if (!description || typeof description !== 'string') {
+                        description = poi.name; // Use name as fallback
+                        console.warn(`[TransactionalOutboxPublisher] POI ${poi.name} missing description, using name as fallback`);
+                    }
+
+                    let isExported = poi.isExported || poi.is_exported;
+                    if (typeof isExported !== 'boolean') {
+                        isExported = false; // Default to false
+                        if (isExported !== undefined) {
+                            console.warn(`[TransactionalOutboxPublisher] POI ${poi.name} has invalid is_exported value, defaulting to false`);
+                        }
+                    }
+
+                    // Generate a unique hash for each POI
+                    const hash = crypto.createHash('md5');
+                    hash.update(filePath);
+                    hash.update(poi.name);
+                    hash.update(poi.type);
+                    hash.update(String(poi.startLine || poi.start_line || 0));
+                    const poiHash = hash.digest('hex');
+                    
+                    // Get or create file_id for this file path
+                    const db = this.dbManager.getDb();
+                    let fileRecord = db.prepare('SELECT id FROM files WHERE file_path = ?').get(filePath);
+                    if (!fileRecord) {
+                        const insertResult = db.prepare('INSERT INTO files (file_path, status) VALUES (?, ?)').run(filePath, 'processed');
+                        fileRecord = { id: insertResult.lastInsertRowid };
+                    }
+
+                    if (!fileRecord || !fileRecord.id) {
+                        throw new Error(`Failed to get or create file record for ${filePath}`);
+                    }
+                    
+                    this.batchWriter.addPoiInsert({
+                        fileId: fileRecord.id,
+                        filePath: filePath,
+                        name: poi.name.trim(),
+                        type: poi.type.toLowerCase(),
+                        startLine: poi.startLine || poi.start_line || 1,
+                        endLine: poi.endLine || poi.end_line || (poi.startLine || poi.start_line || 1),
+                        description: description.trim(),
+                        isExported: isExported,
+                        semanticId: poi.semantic_id || null,
+                        llmOutput: JSON.stringify(poi),
+                        hash: poiHash,
+                        runId: runId
+                    });
+                } catch (error) {
+                    console.error(`[TransactionalOutboxPublisher] Error processing POI ${poi.name || 'unknown'}:`, error);
+                    // Continue processing other POIs instead of failing the entire batch
+                }
             }
             
-            // Also create relationship resolution jobs (keep existing queue logic)
+            // Flush POIs to database first
+            await this.batchWriter.flush();
+            
+            // Query the inserted POIs to get their database IDs and semantic IDs
+            const db = this.dbManager.getDb();
+            const insertedPois = db.prepare(`
+                SELECT id, name, type, start_line, end_line, description, is_exported, semantic_id, hash
+                FROM pois 
+                WHERE file_path = ? AND run_id = ?
+            `).all(filePath, runId);
+            
+            if (insertedPois.length === 0) {
+                console.warn(`[TransactionalOutboxPublisher] No POIs found in database after insertion for ${filePath}`);
+                return;
+            }
+            
+            // Create relationship resolution jobs with proper database IDs
             const queue = this.queueManager.getQueue('relationship-resolution-queue');
-            for (const primaryPoi of pois) {
+            for (const primaryPoi of insertedPois) {
                 const jobPayload = {
                     type: 'relationship-analysis-poi',
                     source: 'TransactionalOutboxPublisher',
@@ -158,11 +249,31 @@ class TransactionalOutboxPublisher {
                     runId: runId,
                     filePath: filePath,
                     primaryPoi: primaryPoi,
-                    contextualPois: pois.filter(p => p.id !== primaryPoi.id)
+                    contextualPois: insertedPois.filter(p => p.id !== primaryPoi.id)
                 };
                 await queue.add(jobPayload.type, jobPayload);
             }
         }
+    }
+
+    async _handleDirectoryAnalysisFinding(event) {
+        const payload = JSON.parse(event.payload);
+        const { runId, directoryPath, summary } = payload;
+
+        if (!directoryPath || !summary) {
+            console.warn(`[TransactionalOutboxPublisher] Invalid directory analysis finding missing required fields:`, payload);
+            return;
+        }
+
+        console.log(`[TransactionalOutboxPublisher] Writing directory summary for ${directoryPath}`);
+        
+        // Write directory summary directly to database using batch writer
+        this.batchWriter.addDirectoryInsert(runId, directoryPath, summary);
+        
+        // Flush to ensure directory summary is written
+        await this.batchWriter.flush();
+        
+        console.log(`[TransactionalOutboxPublisher] Successfully wrote directory summary for ${directoryPath}`);
     }
 
     async _handleBatchedRelationshipFindings(events) {
@@ -188,19 +299,59 @@ class TransactionalOutboxPublisher {
             
             for (const relationship of allRelationships) {
                 try {
-                    // Find source POI ID
-                    const sourcePoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.from, runId);
-                    const targetPoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.to, runId);
+                    // Validate required relationship fields
+                    if (!relationship.from || typeof relationship.from !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid relationship missing 'from' field, skipping:`, relationship);
+                        continue;
+                    }
+                    
+                    if (!relationship.to || typeof relationship.to !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid relationship missing 'to' field, skipping:`, relationship);
+                        continue;
+                    }
+                    
+                    if (!relationship.type || typeof relationship.type !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid relationship missing type, skipping:`, relationship);
+                        continue;
+                    }
+
+                    // Validate and provide defaults for new required fields
+                    let confidence = relationship.confidence;
+                    if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) {
+                        confidence = 0.8; // Default confidence
+                        if (relationship.confidence !== undefined) {
+                            console.warn(`[TransactionalOutboxPublisher] Invalid confidence ${relationship.confidence} for relationship ${relationship.from} -> ${relationship.to}, using default 0.8`);
+                        }
+                    }
+
+                    let reason = relationship.reason;
+                    if (!reason || typeof reason !== 'string') {
+                        reason = `${relationship.type} relationship detected`; // Default reason
+                        console.warn(`[TransactionalOutboxPublisher] Missing reason for relationship ${relationship.from} -> ${relationship.to}, using default`);
+                    }
+
+                    // Find source and target POI IDs using semantic IDs first, then fallback to names
+                    let sourcePoi = db.prepare('SELECT id FROM pois WHERE semantic_id = ? AND run_id = ? LIMIT 1').get(relationship.from, runId);
+                    if (!sourcePoi) {
+                        sourcePoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.from, runId);
+                    }
+                    
+                    let targetPoi = db.prepare('SELECT id FROM pois WHERE semantic_id = ? AND run_id = ? LIMIT 1').get(relationship.to, runId);
+                    if (!targetPoi) {
+                        targetPoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.to, runId);
+                    }
                     
                     if (sourcePoi && targetPoi) {
                         // Insert relationship with POI IDs
                         this.batchWriter.addRelationshipInsert({
                             sourcePoiId: sourcePoi.id,
                             targetPoiId: targetPoi.id,
-                            type: relationship.type,
-                            filePath: relationship.filePath || relationship.file_path,
+                            type: relationship.type.toUpperCase(),
+                            filePath: relationship.filePath || relationship.file_path || '',
                             status: 'PENDING', // Will be updated to VALIDATED by ReconciliationWorker
-                            confidenceScore: relationship.confidence || 0.8
+                            confidence: confidence,
+                            reason: reason.trim(),
+                            runId: runId
                         });
                         
                         console.log(`[TransactionalOutboxPublisher] Queued relationship ${relationship.from} -> ${relationship.to} (IDs: ${sourcePoi.id} -> ${targetPoi.id})`);
@@ -253,12 +404,222 @@ class TransactionalOutboxPublisher {
         switch (eventType) {
             case 'file-analysis-finding':
             case 'relationship-analysis-finding':
+            case 'global-relationship-analysis-finding':
             case 'directory-analysis-finding':
                 return null;
             default:
                 console.warn(`[TransactionalOutboxPublisher] No queue configured for event type: ${eventType}`);
                 return null;
         }
+    }
+
+    /**
+     * Handle global relationship analysis findings
+     */
+    async _handleBatchedGlobalRelationshipFindings(events) {
+        const db = this.dbManager.getDb();
+        const queue = this.queueManager.getQueue('analysis-findings-queue');
+        let allRelationships = [];
+        let runId = null;
+
+        for (const event of events) {
+            const payload = JSON.parse(event.payload);
+            if (!runId) runId = payload.runId;
+            if (payload.relationships) {
+                // Mark cross-file relationships with metadata
+                const crossFileRelationships = payload.relationships.map(rel => ({
+                    ...rel,
+                    cross_file: true,
+                    analysis_type: 'global'
+                }));
+                allRelationships.push(...crossFileRelationships);
+            }
+        }
+
+        if (allRelationships.length > 0) {
+            console.log(`[TransactionalOutboxPublisher] Writing ${allRelationships.length} cross-file relationships to database`);
+            
+            // Write cross-file relationships directly to database using batch writer
+            for (const relationship of allRelationships) {
+                try {
+                    // Validate required relationship fields
+                    if (!relationship.from || typeof relationship.from !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid cross-file relationship missing 'from' field, skipping:`, relationship);
+                        continue;
+                    }
+                    
+                    if (!relationship.to || typeof relationship.to !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid cross-file relationship missing 'to' field, skipping:`, relationship);
+                        continue;
+                    }
+                    
+                    if (!relationship.type || typeof relationship.type !== 'string') {
+                        console.warn(`[TransactionalOutboxPublisher] Invalid cross-file relationship missing type, skipping:`, relationship);
+                        continue;
+                    }
+
+                    let confidence = relationship.confidence;
+                    if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) {
+                        confidence = 0.8; // Default confidence
+                        if (relationship.confidence !== undefined) {
+                            console.warn(`[TransactionalOutboxPublisher] Invalid confidence ${relationship.confidence} for cross-file relationship ${relationship.from} -> ${relationship.to}, using default 0.8`);
+                        }
+                    }
+
+                    let reason = relationship.reason;
+                    if (!reason || typeof reason !== 'string') {
+                        reason = `${relationship.type} cross-file relationship detected`;
+                        console.warn(`[TransactionalOutboxPublisher] Missing reason for cross-file relationship ${relationship.from} -> ${relationship.to}, using default`);
+                    }
+
+                    // Find source and target POI IDs using semantic IDs first, then fallback to names
+                    let sourcePoi = db.prepare('SELECT id FROM pois WHERE semantic_id = ? AND run_id = ? LIMIT 1').get(relationship.from, runId);
+                    if (!sourcePoi) {
+                        sourcePoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.from, runId);
+                    }
+                    
+                    let targetPoi = db.prepare('SELECT id FROM pois WHERE semantic_id = ? AND run_id = ? LIMIT 1').get(relationship.to, runId);
+                    if (!targetPoi) {
+                        targetPoi = db.prepare('SELECT id FROM pois WHERE name = ? AND run_id = ? LIMIT 1').get(relationship.to, runId);
+                    }
+                    
+                    if (sourcePoi && targetPoi) {
+                        // Insert cross-file relationship with POI IDs
+                        this.batchWriter.addRelationshipInsert({
+                            sourcePoiId: sourcePoi.id,
+                            targetPoiId: targetPoi.id,
+                            type: relationship.type.toUpperCase(),
+                            filePath: relationship.from_file || relationship.to_file || '',
+                            status: 'CROSS_FILE_VALIDATED', // Special status for cross-file relationships
+                            confidence: confidence,
+                            reason: reason.trim(),
+                            runId: runId
+                        });
+                        
+                        console.log(`[TransactionalOutboxPublisher] Queued cross-file relationship ${relationship.from} -> ${relationship.to} (IDs: ${sourcePoi.id} -> ${targetPoi.id})`);
+                    } else {
+                        console.warn(`[TransactionalOutboxPublisher] Could not resolve POI IDs for cross-file relationship ${relationship.from} -> ${relationship.to}`);
+                        if (!sourcePoi) console.warn(`  Source POI '${relationship.from}' not found`);
+                        if (!targetPoi) console.warn(`  Target POI '${relationship.to}' not found`);
+                    }
+                } catch (error) {
+                    console.error(`[TransactionalOutboxPublisher] Error processing cross-file relationship ${relationship.from} -> ${relationship.to}:`, error.message);
+                }
+            }
+            
+            // Use batch writer for status updates
+            const publishedUpdates = events.map(e => ({ id: e.id, status: 'PUBLISHED' }));
+            this.batchWriter.addOutboxUpdatesBatch(publishedUpdates);
+            
+            console.log(`[TransactionalOutboxPublisher] Published cross-file relationships and queued ${events.length} events for status update.`);
+        }
+    }
+
+    /**
+     * Check if we should trigger global cross-file analysis
+     * This runs after all file analysis and intra-file relationships are processed
+     */
+    async _checkAndTriggerGlobalAnalysis() {
+        const db = this.dbManager.getDb();
+        
+        // Get all active runs that have completed file analysis but haven't had global analysis
+        const activeRuns = db.prepare(`
+            SELECT DISTINCT run_id, COUNT(DISTINCT file_path) as file_count
+            FROM pois 
+            WHERE run_id IS NOT NULL
+            GROUP BY run_id
+            HAVING file_count > 1
+        `).all();
+        
+        for (const runInfo of activeRuns) {
+            const runId = runInfo.run_id;
+            const fileCount = runInfo.file_count;
+            
+            // Check if global analysis has already been triggered for this run
+            const existingGlobalAnalysis = db.prepare(`
+                SELECT COUNT(*) as count 
+                FROM outbox 
+                WHERE event_type = 'global-relationship-analysis-finding' 
+                  AND payload LIKE ?
+            `).get(`%"runId":"${runId}"%`).count;
+            
+            // Check if we have any pending file analysis for this run
+            const pendingFileAnalysis = db.prepare(`
+                SELECT COUNT(*) as count 
+                FROM outbox 
+                WHERE event_type = 'file-analysis-finding' 
+                  AND status = 'PENDING'
+                  AND payload LIKE ?
+            `).get(`%"runId":"${runId}"%`).count;
+            
+            // Check if we have any pending relationship analysis for this run
+            const pendingRelationshipAnalysis = db.prepare(`
+                SELECT COUNT(*) as count 
+                FROM outbox 
+                WHERE event_type = 'relationship-analysis-finding' 
+                  AND status = 'PENDING'
+                  AND payload LIKE ?
+            `).get(`%"runId":"${runId}"%`).count;
+            
+            // Trigger global analysis if:
+            // 1. No existing global analysis for this run
+            // 2. No pending file or relationship analysis
+            // 3. Multiple files in the run (cross-file analysis only makes sense with multiple files)
+            if (existingGlobalAnalysis === 0 && 
+                pendingFileAnalysis === 0 && 
+                pendingRelationshipAnalysis === 0 && 
+                fileCount > 1) {
+                
+                console.log(`[TransactionalOutboxPublisher] Triggering global cross-file analysis for run ${runId} with ${fileCount} files`);
+                await this._triggerGlobalAnalysisForRun(runId);
+            }
+        }
+    }
+
+    /**
+     * Trigger global cross-file analysis for a specific run
+     */
+    async _triggerGlobalAnalysisForRun(runId) {
+        const db = this.dbManager.getDb();
+        
+        // Get all unique directories for this run
+        const directories = db.prepare(`
+            SELECT DISTINCT 
+                CASE 
+                    WHEN file_path LIKE '%/%' THEN SUBSTR(file_path, 1, LENGTH(file_path) - LENGTH(SUBSTR(file_path, INSTR(file_path, '/', -1) + 1)))
+                    WHEN file_path LIKE '%\\%' THEN SUBSTR(file_path, 1, LENGTH(file_path) - LENGTH(SUBSTR(file_path, INSTR(file_path, '\\', -1) + 1)))
+                    ELSE '.'
+                END as directory_path
+            FROM pois 
+            WHERE run_id = ?
+        `).all(runId);
+        
+        const globalAnalysisQueue = this.queueManager.getQueue('global-relationship-analysis-queue');
+        
+        // Create global analysis jobs for each directory
+        let batchNumber = 1;
+        const totalBatches = directories.length;
+        
+        for (const dir of directories) {
+            const directoryPath = dir.directory_path || '.';
+            
+            const jobPayload = {
+                type: 'global-relationship-analysis',
+                source: 'TransactionalOutboxPublisher',
+                jobId: `global-${runId}-${batchNumber}`,
+                runId: runId,
+                directoryPath: directoryPath,
+                batchNumber: batchNumber,
+                totalBatches: totalBatches
+            };
+            
+            await globalAnalysisQueue.add(jobPayload.type, jobPayload);
+            console.log(`[TransactionalOutboxPublisher] Created global analysis job ${batchNumber}/${totalBatches} for directory: ${directoryPath}`);
+            
+            batchNumber++;
+        }
+        
+        console.log(`[TransactionalOutboxPublisher] Created ${totalBatches} global analysis jobs for run ${runId}`);
     }
     
     /**

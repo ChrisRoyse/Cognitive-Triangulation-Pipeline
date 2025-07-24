@@ -4,6 +4,7 @@ const { Worker } = require('bullmq');
 const { v4: uuidv4 } = require('uuid');
 const LLMResponseSanitizer = require('../utils/LLMResponseSanitizer');
 const { ManagedWorker } = require('./ManagedWorker');
+const { PipelineConfig } = require('../config/pipelineConfig');
 
 class DirectoryResolutionWorker {
     constructor(queueManager, dbManager, cacheClient, llmClient, workerPoolManager, options = {}) {
@@ -13,13 +14,17 @@ class DirectoryResolutionWorker {
         this.llmClient = llmClient;
         this.workerPoolManager = workerPoolManager;
         
+        // Use centralized configuration
+        this.config = options.pipelineConfig || PipelineConfig.createDefault();
+        const workerLimit = this.config.getWorkerLimit('directory-resolution');
+        
         if (!options.processOnly) {
             if (workerPoolManager) {
                 // Create managed worker with intelligent concurrency control
                 this.managedWorker = new ManagedWorker('directory-resolution-queue', workerPoolManager, {
                     workerType: 'directory-resolution',
-                    baseConcurrency: 2, // Conservative for directory analysis
-                    maxConcurrency: 8,
+                    baseConcurrency: Math.min(5, workerLimit), // Conservative for directory analysis
+                    maxConcurrency: workerLimit,
                     minConcurrency: 1,
                     rateLimitRequests: 6, // Conservative for LLM calls
                     rateLimitWindow: 1000,
@@ -93,13 +98,12 @@ class DirectoryResolutionWorker {
                 summary: summary,
             };
 
+            // Write to outbox instead of directly to database to maintain event-sourcing pattern
             const db = this.dbManager.getDb();
-            const stmt = db.prepare(
-                'INSERT INTO directory_summaries (run_id, directory_path, summary_text) VALUES (?, ?, ?)'
-            );
-            stmt.run(runId, directoryPath, summary);
+            const stmt = db.prepare('INSERT INTO outbox (run_id, event_type, payload, status) VALUES (?, ?, ?, ?)');
+            stmt.run(runId, 'directory-analysis-finding', JSON.stringify(findingPayload), 'PENDING');
 
-            console.log(`[DirectoryResolutionWorker] Wrote finding for ${directoryPath} to outbox.`);
+            console.log(`[DirectoryResolutionWorker] Wrote directory analysis finding for ${directoryPath} to outbox.`);
         } catch (error) {
             console.error(`[DirectoryResolutionWorker] Error processing job ${job.id} for directory ${directoryPath}:`, error);
             throw error;
