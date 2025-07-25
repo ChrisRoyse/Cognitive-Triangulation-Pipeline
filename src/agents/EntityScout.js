@@ -8,13 +8,12 @@ const { POI_SCHEMA } = require('../utils/jsonSchemaValidator');
 const Ajv = require('ajv');
 const ajv = new Ajv();
 const validatePoiList = ajv.compile(POI_SCHEMA);
-const config = require('../config');
+const config = require('../../config');
 
 class EntityScout {
-    constructor(db, llmClient, targetDirectory) {
+    constructor(db, llmClient) {
         this.db = db;
         this.llmClient = llmClient || getDeepseekClient();
-        this.targetDirectory = targetDirectory;
         
         // Set up default configuration with proper defaults for missing properties
         const defaultConfig = {
@@ -220,11 +219,8 @@ Return ONLY the corrected JSON object.`;
         };
     }
 
-    async run() {
-        console.log(`Starting EntityScout for directory: ${this.targetDirectory}`);
-        
-        const files = await this._discoverFiles(this.targetDirectory);
-        console.log(`Found ${files.length} files to process`);
+    async processFiles(files) {
+        console.log(`Starting EntityScout processing ${files.length} files`);
         
         const concurrencyLimit = 50;
         const promises = [];
@@ -252,7 +248,8 @@ Return ONLY the corrected JSON object.`;
             }
         };
 
-        for (const filePath of files) {
+        for (const file of files) {
+            const filePath = typeof file === 'string' ? file : file.path;
             const promise = (async () => {
                 await acquire();
                 try {
@@ -285,33 +282,6 @@ Return ONLY the corrected JSON object.`;
         return { processedCount, successCount };
     }
 
-    async _discoverFiles(directory) {
-        const files = [];
-        const supportedExtensions = ['.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.cpp', '.c', '.h', '.cs', '.php', '.rb', '.go', '.sql'];
-        
-        async function walkDirectory(dir) {
-            const entries = await fs.readdir(dir, { withFileTypes: true });
-            
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                
-                if (entry.isDirectory()) {
-                    // Skip common directories that shouldn't be analyzed
-                    if (!['node_modules', '.git', 'dist', 'build', '.next', 'coverage'].includes(entry.name)) {
-                        await walkDirectory(fullPath);
-                    }
-                } else if (entry.isFile()) {
-                    const ext = path.extname(entry.name);
-                    if (supportedExtensions.includes(ext)) {
-                        files.push(fullPath);
-                    }
-                }
-            }
-        }
-        
-        await walkDirectory(directory);
-        return files;
-    }
 
     async _processFile(filePath) {
         // Set current file for language-specific prompt generation
