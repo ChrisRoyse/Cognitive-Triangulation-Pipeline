@@ -7,7 +7,7 @@ async function initializeDatabase() {
     console.log('🚀 Initializing database...');
     
     try {
-        const dbPath = process.env.SQLITE_DB_PATH || './database.db';
+        const dbPath = process.env.SQLITE_DB_PATH || './data/database.db';
         console.log(`📍 Database path: ${dbPath}`);
         
         const dbManager = new DatabaseManager(dbPath);

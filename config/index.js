@@ -13,5 +13,8 @@ module.exports = {
         'relationship-validated-queue',
         'llm-analysis-queue', // Added for the new pipeline
         'graph-ingestion-queue', // Added for the new pipeline
+        'global-relationship-analysis-queue', // Added for cross-file cognitive triangulation
+        'triangulated-analysis-queue', // Added for triangulated analysis system
+        'relationship-confidence-escalation', // Added for confidence escalation handling
     ],
 };

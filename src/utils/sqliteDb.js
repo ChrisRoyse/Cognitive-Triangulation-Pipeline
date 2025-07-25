@@ -15,7 +15,7 @@ class DatabaseManager {
      */
     constructor(dbPath) {
         if (!dbPath) {
-            throw new Error('Database path is required.');
+            throw new Error('[DatabaseManager] Database path is required. Provide a valid path to the SQLite database file.');
         }
         this.dbPath = dbPath;
         this.db = null;
@@ -28,9 +28,21 @@ class DatabaseManager {
      */
     getDb() {
         if (!this.db) {
-            this.db = new Database(this.dbPath);
-            this.db.pragma('journal_mode = WAL');
-            this.db.pragma('foreign_keys = ON');
+            try {
+                this.db = new Database(this.dbPath);
+                this.db.pragma('journal_mode = WAL');
+                this.db.pragma('foreign_keys = ON');
+            } catch (error) {
+                const errorMsg = `[DatabaseManager] Failed to connect to database at ${this.dbPath}`;
+                this.logger.error(errorMsg, {
+                    error: error.message,
+                    errorCode: error.code,
+                    dbPath: this.dbPath,
+                    action: 'Check database file permissions, path validity, and disk space. Ensure parent directory exists.',
+                    stack: error.stack
+                });
+                throw new Error(`${errorMsg}: ${error.message}`);
+            }
         }
         return this.db;
     }
@@ -39,10 +51,28 @@ class DatabaseManager {
      * Initializes the database with the schema.
      */
     async initializeDb() {
-        const db = this.getDb();
-        const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
-        db.exec(schema);
-        await this.applyMigrations();
+        try {
+            const db = this.getDb();
+            const schemaPath = path.join(__dirname, 'schema.sql');
+            
+            if (!fs.existsSync(schemaPath)) {
+                throw new Error(`Schema file not found at ${schemaPath}`);
+            }
+            
+            const schema = fs.readFileSync(schemaPath, 'utf-8');
+            db.exec(schema);
+            await this.applyMigrations();
+        } catch (error) {
+            const errorMsg = '[DatabaseManager] Failed to initialize database';
+            this.logger.error(errorMsg, {
+                error: error.message,
+                errorType: error.name,
+                dbPath: this.dbPath,
+                action: 'Check schema.sql exists and is valid SQL. Verify database write permissions.',
+                stack: error.stack
+            });
+            throw new Error(`${errorMsg}: ${error.message}`);
+        }
     }
 
     /**
@@ -127,7 +157,7 @@ let globalDbManager = null;
  * Initialize the global database connection
  */
 async function initializeDb() {
-    const dbPath = process.env.SQLITE_DB_PATH || './database.db';
+    const dbPath = process.env.SQLITE_DB_PATH || './data/database.db';
     globalDbManager = new DatabaseManager(dbPath);
     globalDbManager.initializeDb();
 }

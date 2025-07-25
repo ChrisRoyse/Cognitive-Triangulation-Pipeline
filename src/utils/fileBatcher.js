@@ -229,8 +229,8 @@ FILES TO ANALYZE:
                     id: this.generatePoiId(),
                     name: poi.name,
                     type: this.normalizePoiType(poi.type),
-                    start_line: poi.start_line || poi.startLine || 1,
-                    end_line: poi.end_line || poi.endLine || poi.start_line || 1
+                    start_line: poi.start_line || 1,
+                    end_line: poi.end_line || poi.start_line || 1
                 })).filter(poi => poi.name && poi.type);
 
                 results[filePath] = validatedPois;

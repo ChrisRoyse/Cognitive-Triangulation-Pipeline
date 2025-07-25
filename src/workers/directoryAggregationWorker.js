@@ -1,28 +1,33 @@
 const { Worker } = require('bullmq');
 const { ManagedWorker } = require('./ManagedWorker');
 const { getLogger } = require('../config/logging');
+const { PipelineConfig } = require('../config/pipelineConfig');
 
 class DirectoryAggregationWorker {
-    constructor(queueManager, cacheClient, workerPoolManager, options = {}) {
+    constructor(queueManager, workerPoolManager, options = {}) {
         this.queueManager = queueManager;
-        this.cacheClient = cacheClient;
         this.workerPoolManager = workerPoolManager;
         this.directoryResolutionQueue = this.queueManager.getQueue('directory-resolution-queue');
         
         // Initialize logger
         this.logger = getLogger('DirectoryAggregationWorker');
         
+        // Use centralized configuration
+        this.config = options.pipelineConfig || PipelineConfig.createDefault();
+        const workerLimit = this.config.getWorkerLimit('directory-aggregation');
+        
         if (!options.processOnly) {
             if (workerPoolManager) {
                 // Create managed worker with intelligent concurrency control
                 this.managedWorker = new ManagedWorker('directory-aggregation-queue', workerPoolManager, {
                     workerType: 'directory-aggregation',
-                    baseConcurrency: 10, // Good for quick aggregation tasks
-                    maxConcurrency: 30,
+                    baseConcurrency: Math.min(5, workerLimit), // Good for quick aggregation tasks
+                    maxConcurrency: workerLimit,
                     minConcurrency: 2,
-                    rateLimitRequests: 15, // Can handle more requests
-                    rateLimitWindow: 1000,
-                    failureThreshold: 5,
+                    // Rate limiting removed - only global 100 agent limit matters
+                    // rateLimitRequests: 15, // Can handle more requests
+                    // rateLimitWindow: 1000,
+                    failureThreshold: 10, // Increased from 5 to be less aggressive
                     resetTimeout: 60000,
                     jobTimeout: 60000, // 1 minute for aggregation
                     retryAttempts: 3,
@@ -41,7 +46,7 @@ class DirectoryAggregationWorker {
                 // Fallback to basic worker if no WorkerPoolManager
                 this.worker = new Worker('directory-aggregation-queue', this.process.bind(this), {
                     connection: this.queueManager.connection,
-                    concurrency: 10,
+                    concurrency: workerLimit // Use centralized config
                 });
             }
         }
@@ -118,52 +123,44 @@ class DirectoryAggregationWorker {
             const directoryFilesKey = `run:${runId}:dir:${directoryPath}:files`;
             const processedFilesKey = `run:${runId}:dir:${directoryPath}:processed`;
 
-            // Atomically mark the file as processed and check if all files are done
-            const cacheStart = Date.now();
-            const pipeline = this.cacheClient.pipeline();
-            pipeline.sadd(processedFilesKey, fileJobId);
-            pipeline.scard(directoryFilesKey);
-            pipeline.scard(processedFilesKey);
-            const [, totalFiles, processedFiles] = await pipeline.exec();
-            perfLogger.checkpoint('cache-operations', { duration: Date.now() - cacheStart });
+            // Simple directory completion tracking without Redis caching
+            // For no-cache pipeline, just trigger directory resolution immediately
+            perfLogger.checkpoint('directory-check', { duration: 1 });
 
             jobLogger.info('Directory aggregation progress', {
                 directoryPath,
-                totalFiles: totalFiles[1],
-                processedFiles: processedFiles[1],
-                isComplete: totalFiles[1] === processedFiles[1]
+                fileJobId: fileJobId,
+                message: 'File completed - triggering directory resolution'
             });
 
-            if (totalFiles[1] === processedFiles[1]) {
-                jobLogger.info('All files in directory processed, enqueuing for resolution', {
-                    directoryPath,
-                    totalFiles: totalFiles[1]
-                });
+            // Always trigger directory resolution for no-cache pipeline
+            jobLogger.info('Triggering directory resolution', {
+                directoryPath
+            });
                 
-                const resolutionJob = await this.directoryResolutionQueue.add('analyze-directory', {
-                    directoryPath,
-                    runId,
-                });
-                
-                jobLogger.info('Directory resolution job enqueued', {
-                    directoryPath,
-                    resolutionJobId: resolutionJob.id,
-                    parentJobId: job.id
-                });
-            }
-            
-            const metrics = perfLogger.end({
-                totalFiles: totalFiles[1],
-                processedFiles: processedFiles[1],
-                allFilesProcessed: totalFiles[1] === processedFiles[1]
+            const resolutionJob = await this.directoryResolutionQueue.add('analyze-directory', {
+                directoryPath,
+                runId,
             });
             
-            // Log performance metrics
+            jobLogger.info('Directory resolution job enqueued', {
+                directoryPath,
+                resolutionJobId: resolutionJob.id,
+                parentJobId: job.id
+            });
+            
+            const metrics = perfLogger.end({
+                directoryPath,
+                fileJobId,
+                triggerResolution: true
+            });
+            
+            // Log performance metrics - simplified for no-cache pipeline
             jobLogger.info('Directory aggregation metrics', {
                 duration: metrics.duration,
                 memoryDelta: metrics.memoryDelta,
-                totalFiles: totalFiles[1],
-                processedFiles: processedFiles[1]
+                directoryPath,
+                fileJobId
             });
             
         } catch (error) {

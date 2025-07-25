@@ -1,0 +1,158 @@
+{
+  "timestamp": "2025-07-25T01:43:15.364Z",
+  "summary": {
+    "total_tests": 17,
+    "passed": 4,
+    "failed": 13,
+    "success_rate": "23.5%"
+  },
+  "vulnerability_analysis": {
+    "critical_failures": 3,
+    "performance_failures": 2,
+    "data_integrity_failures": 3
+  },
+  "detailed_results": [
+    {
+      "name": "Database Corruption Handling - Graceful Error Handling",
+      "passed": true,
+      "description": "Correctly detected and handled database corruption",
+      "timestamp": "2025-07-25T01:43:07.501Z"
+    },
+    {
+      "name": "Database Corruption Handling",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:07.512Z"
+    },
+    {
+      "name": "File Lock Conflict Handling",
+      "passed": true,
+      "description": "Correctly handled database lock conflict",
+      "timestamp": "2025-07-25T01:43:14.838Z"
+    },
+    {
+      "name": "Memory Constraint Handling",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:14.910Z"
+    },
+    {
+      "name": "Concurrent Access Handling",
+      "passed": false,
+      "description": "All concurrent processes failed",
+      "timestamp": "2025-07-25T01:43:14.928Z"
+    },
+    {
+      "name": "Concurrent Access Handling - Data Integrity",
+      "passed": true,
+      "description": "Database integrity maintained during concurrent access",
+      "timestamp": "2025-07-25T01:43:14.929Z"
+    },
+    {
+      "name": "Malformed Data Handling",
+      "passed": false,
+      "description": "12 validation issues remain after cleanup",
+      "timestamp": "2025-07-25T01:43:15.011Z"
+    },
+    {
+      "name": "Partial Migration Recovery",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:15.026Z"
+    },
+    {
+      "name": "Schema Corruption Recovery",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:15.045Z"
+    },
+    {
+      "name": "Network Interruption Handling",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:15.063Z"
+    },
+    {
+      "name": "Permission Denied Handling",
+      "passed": false,
+      "description": "Failed to handle permission denied scenarios",
+      "timestamp": "2025-07-25T01:43:15.071Z"
+    },
+    {
+      "name": "Large Dataset Handling",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:15.117Z"
+    },
+    {
+      "name": "Circular Reference Handling",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:15.145Z"
+    },
+    {
+      "name": "Evidence Validation Edge Cases",
+      "passed": false,
+      "description": "Test failed with error: no such column: evidence",
+      "timestamp": "2025-07-25T01:43:15.195Z"
+    },
+    {
+      "name": "Graph Builder Stress Test",
+      "passed": false,
+      "description": "Test failed with error: no such table: relationship_evidence",
+      "timestamp": "2025-07-25T01:43:15.249Z"
+    },
+    {
+      "name": "Confidence Scoring Extremes",
+      "passed": false,
+      "description": "1/8 confidence scoring tests failed",
+      "timestamp": "2025-07-25T01:43:15.314Z"
+    },
+    {
+      "name": "Consolidation Rollback",
+      "passed": true,
+      "description": "Successfully preserved original data when consolidation failed",
+      "timestamp": "2025-07-25T01:43:15.363Z"
+    }
+  ],
+  "recommendations": [
+    {
+      "priority": "CRITICAL",
+      "category": "Data Safety",
+      "issue": "Critical failures in corruption handling, concurrency, or rollback mechanisms",
+      "action": "Implement robust transaction handling, file locking, and backup/restore mechanisms",
+      "failures": [
+        "Database Corruption Handling",
+        "Concurrent Access Handling",
+        "Schema Corruption Recovery"
+      ]
+    },
+    {
+      "priority": "HIGH",
+      "category": "Performance",
+      "issue": "Performance degradation under stress conditions",
+      "action": "Optimize memory usage, implement batching, and add performance monitoring",
+      "failures": [
+        "Memory Constraint Handling",
+        "Large Dataset Handling"
+      ]
+    },
+    {
+      "priority": "MEDIUM",
+      "category": "Data Integrity",
+      "issue": "Edge cases in data validation and confidence scoring",
+      "action": "Enhance input validation, add boundary checks, and improve error handling",
+      "failures": [
+        "Malformed Data Handling",
+        "Evidence Validation Edge Cases",
+        "Confidence Scoring Extremes"
+      ]
+    },
+    {
+      "priority": "LOW",
+      "category": "Monitoring",
+      "issue": "Need for continuous monitoring of edge cases in production",
+      "action": "Implement comprehensive logging, metrics, and automated testing in CI/CD"
+    }
+  ]
+}

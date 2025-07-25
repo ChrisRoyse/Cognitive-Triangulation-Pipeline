@@ -2,6 +2,9 @@
 # CTP - Git Ignore Configuration
 # ===========================================
 
+# Git Repository Files
+.git/
+
 # Environment Variables & Secrets
 .env
 .env.local

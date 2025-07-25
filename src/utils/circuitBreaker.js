@@ -1,430 +1,596 @@
-/**
- * Circuit Breaker Implementation
- * 
- * Implements the circuit breaker pattern to prevent cascade failures:
- * - CLOSED: Normal operation, requests flow through
- * - OPEN: Service is down, fail fast without making requests
- * - HALF_OPEN: Testing if service recovered, limited requests allowed
- * 
- * Features:
- * - Configurable failure thresholds
- * - Exponential backoff for recovery attempts  
- * - Health check integration
- * - Metrics and monitoring
- * - Event callbacks for state changes
- */
+const fs = require('fs');
+const path = require('path');
 
 class CircuitBreaker {
     constructor(options = {}) {
-        // Configuration
         this.name = options.name || 'default';
         this.failureThreshold = options.failureThreshold || 5;
-        this.successThreshold = options.successThreshold || 2; // Successes needed to close from half-open
-        this.timeout = options.timeout || 60000; // 1 minute default
-        this.monitor = options.monitor || this.defaultMonitor.bind(this);
         this.resetTimeout = options.resetTimeout || 60000;
-        this.halfOpenMaxCalls = options.halfOpenMaxCalls || 3;
         
-        // State
-        this.state = 'CLOSED';
-        this.failures = 0;
-        this.successes = 0;
-        this.nextAttempt = 0;
-        this.halfOpenCalls = 0;
+        // Atomic state management
+        this._state = 'CLOSED';
+        this._failures = 0;
+        this._nextAttempt = 0;
+        this._stateMutex = false;
         
-        // Statistics
-        this.stats = {
-            requests: 0,
-            successes: 0,
-            failures: 0,
-            rejected: 0,
-            stateChanges: 0,
-            lastFailure: null,
-            lastSuccess: null,
-            stateHistory: []
+        // State transition lock methods
+        this._lockState = () => {
+            if (this._stateMutex) return false;
+            this._stateMutex = true;
+            return true;
         };
         
-        // Event callbacks
-        this.onStateChange = options.onStateChange || (() => {});
-        this.onFailure = options.onFailure || (() => {});
-        this.onSuccess = options.onSuccess || (() => {});
+        this._unlockState = () => {
+            this._stateMutex = false;
+        };
         
-        console.log(`🔒 Circuit breaker '${this.name}' initialized`);
-    }
-
-    /**
-     * Execute operation with circuit breaker protection
-     */
-    async execute(operation, fallback = null) {
-        return new Promise(async (resolve, reject) => {
-            // Check if circuit breaker allows execution
-            if (!this.allowRequest()) {
-                this.stats.rejected++;
-                const error = new Error(`Circuit breaker '${this.name}' is OPEN`);
-                error.code = 'CIRCUIT_BREAKER_OPEN';
-                
-                if (fallback && typeof fallback === 'function') {
-                    try {
-                        const fallbackResult = await fallback();
-                        resolve(fallbackResult);
-                        return;
-                    } catch (fallbackError) {
-                        reject(fallbackError);
-                        return;
-                    }
+        // Atomic state access properties
+        Object.defineProperty(this, 'state', {
+            get() { return this._state; },
+            set(value) {
+                if (!this._stateMutex) {
+                    // Allow direct read but warn about unsafe writes
+                    console.warn(`⚠️ [CircuitBreaker:${this.name}] Unsafe state modification outside lock`);
                 }
-                
-                reject(error);
-                return;
-            }
-
-            this.stats.requests++;
-            const startTime = Date.now();
-
-            try {
-                // Execute the operation
-                const result = await operation();
-                
-                // Record success
-                const duration = Date.now() - startTime;
-                this.onSuccessInternal(duration);
-                
-                resolve(result);
-            } catch (error) {
-                // Record failure
-                const duration = Date.now() - startTime;
-                this.onFailureInternal(error, duration);
-                
-                reject(error);
+                this._state = value;
             }
         });
+        
+        Object.defineProperty(this, 'failures', {
+            get() { return this._failures; },
+            set(value) {
+                if (!this._stateMutex) {
+                    console.warn(`⚠️ [CircuitBreaker:${this.name}] Unsafe failures modification outside lock`);
+                }
+                this._failures = value;
+            }
+        });
+        
+        Object.defineProperty(this, 'nextAttempt', {
+            get() { return this._nextAttempt; },
+            set(value) {
+                if (!this._stateMutex) {
+                    console.warn(`⚠️ [CircuitBreaker:${this.name}] Unsafe nextAttempt modification outside lock`);
+                }
+                this._nextAttempt = value;
+            }
+        });
+        
+        // Enhanced recovery properties
+        this.baseRetryDelay = options.baseRetryDelay || 2000; // Start with 2 seconds
+        this.maxRetryDelay = options.maxRetryDelay || 300000; // Cap at 5 minutes
+        this.retryMultiplier = options.retryMultiplier || 2;
+        this.currentRetryDelay = this.baseRetryDelay;
+        this.recoveryAttempts = 0;
+        this.lastRecoveryAttempt = 0;
+        this.partialRecoveryThreshold = options.partialRecoveryThreshold || 0.5; // 50% success rate for full recovery
+        this.partialRecoveryWindow = options.partialRecoveryWindow || 10; // Track last 10 attempts
+        this.recoveryTestRequests = [];
+        this.persistStatePath = options.persistStatePath || null;
+        this.healthCheckFunction = options.healthCheckFunction || null;
+        
+        // Load persisted state if available
+        this.loadPersistedState();
     }
 
-    /**
-     * Check if request should be allowed through
-     */
+    async execute(operation) {
+        if (!this.allowRequest()) {
+            const timeToNext = Math.max(0, this.nextAttempt - Date.now());
+            throw new Error(`Circuit breaker is OPEN, next attempt in ${Math.round(timeToNext/1000)}s`);
+        }
+        
+        try {
+            const result = await operation();
+            this.onSuccess();
+            return result;
+        } catch (error) {
+            this.onFailure();
+            throw error;
+        }
+    }
+
     allowRequest() {
-        const now = Date.now();
-
-        switch (this.state) {
-            case 'CLOSED':
-                return true;
+        // Fast path for CLOSED state (most common case)
+        if (this._state === 'CLOSED') return true;
+        
+        // For state transitions, acquire lock
+        if (this._lockState()) {
+            try {
+                if (this.state === 'CLOSED') return true;
                 
-            case 'OPEN':
-                if (now >= this.nextAttempt) {
-                    this.setState('HALF_OPEN');
-                    return true;
+                if (this.state === 'OPEN') {
+                    if (this.shouldAttemptRecovery()) {
+                        return this.attemptGradualRecovery();
+                    }
+                    return false;
                 }
-                return false;
                 
-            case 'HALF_OPEN':
-                return this.halfOpenCalls < this.halfOpenMaxCalls;
-                
-            default:
-                return false;
+                return this.state === 'HALF_OPEN';
+            } finally {
+                this._unlockState();
+            }
+        } else {
+            // If we can't acquire lock, be conservative
+            return this._state === 'CLOSED' || this._state === 'HALF_OPEN';
         }
     }
 
-    /**
-     * Handle successful operation
-     */
-    onSuccessInternal(duration) {
-        this.stats.successes++;
-        this.stats.lastSuccess = new Date();
-        this.failures = 0; // Reset failure count
+    shouldAttemptRecovery() {
+        const now = Date.now();
         
-        if (this.state === 'HALF_OPEN') {
-            this.successes++;
-            if (this.successes >= this.successThreshold) {
-                this.setState('CLOSED');
+        // Check if enough time has passed since last recovery attempt
+        if (now < this.nextAttempt) {
+            return false;
+        }
+        
+        // Implement exponential backoff for recovery attempts
+        const timeSinceLastAttempt = now - this.lastRecoveryAttempt;
+        return timeSinceLastAttempt >= this.currentRetryDelay;
+    }
+
+    attemptGradualRecovery() {
+        // Must be called within a lock
+        if (!this._stateMutex) {
+            console.warn(`⚠️ [CircuitBreaker:${this.name}] attemptGradualRecovery called outside lock`);
+            return false;
+        }
+        
+        const now = Date.now();
+        this.lastRecoveryAttempt = now;
+        this.recoveryAttempts++;
+        
+        // Transition to HALF_OPEN for testing
+        this.state = 'HALF_OPEN';
+        
+        // Calculate next retry delay with exponential backoff
+        this.currentRetryDelay = Math.min(
+            this.currentRetryDelay * this.retryMultiplier,
+            this.maxRetryDelay
+        );
+        
+        // Set next attempt time based on exponential backoff
+        this.nextAttempt = now + this.currentRetryDelay;
+        
+        this.persistState();
+        
+        console.log(`🔄 [CircuitBreaker:${this.name}] Attempting gradual recovery (attempt ${this.recoveryAttempts}, next backoff: ${Math.round(this.currentRetryDelay/1000)}s)`);
+        
+        return true;
+    }
+
+    async performHealthCheck() {
+        if (!this.healthCheckFunction) {
+            return true; // No health check defined, assume healthy
+        }
+        
+        try {
+            return await this.healthCheckFunction();
+        } catch (error) {
+            console.warn(`⚠️ [CircuitBreaker:${this.name}] Health check failed:`, error.message);
+            return false;
+        }
+    }
+
+    onSuccess() {
+        if (this._lockState()) {
+            try {
+                // Track success for partial recovery analysis
+                if (this.state === 'HALF_OPEN') {
+                    this.recoveryTestRequests.push({ success: true, timestamp: Date.now() });
+                    this.trimRecoveryWindow();
+                    
+                    // Check if we have enough successful requests to fully recover
+                    if (this.shouldFullyRecover()) {
+                        this.state = 'CLOSED';
+                        this.resetRecoveryState();
+                        console.log(`✅ [CircuitBreaker:${this.name}] Full recovery achieved after ${this.recoveryAttempts} attempts`);
+                    } else {
+                        console.log(`🔄 [CircuitBreaker:${this.name}] Partial recovery progress: ${this.getSuccessRate()}% success rate`);
+                    }
+                } else {
+                    this.failures = 0;
+                }
+                
+                this.persistState();
+            } finally {
+                this._unlockState();
             }
         }
-        
-        // Call external success callback
-        this.onSuccess(duration);
-        
-        // Monitor for success pattern
-        this.monitor('success', { duration });
     }
 
-    /**
-     * Handle failed operation
-     */
-    onFailureInternal(error, duration) {
-        this.stats.failures++;
-        this.stats.lastFailure = new Date();
-        this.failures++;
-        
-        if (this.state === 'HALF_OPEN') {
-            // Failed during recovery, go back to OPEN
-            this.setState('OPEN');
-        } else if (this.state === 'CLOSED' && this.failures >= this.failureThreshold) {
-            // Too many failures, open the circuit
-            this.setState('OPEN');
-        }
-        
-        // Call external failure callback
-        this.onFailure(error, duration);
-        
-        // Monitor for failure pattern
-        this.monitor('failure', { error, duration });
-    }
-
-    /**
-     * Change circuit breaker state
-     */
-    setState(newState) {
-        const oldState = this.state;
-        this.state = newState;
-        this.stats.stateChanges++;
-        
-        // Record state change in history
-        this.stats.stateHistory.push({
-            from: oldState,
-            to: newState,
-            timestamp: new Date(),
-            failures: this.failures,
-            successes: this.successes
-        });
-        
-        // Keep only last 10 state changes
-        if (this.stats.stateHistory.length > 10) {
-            this.stats.stateHistory.shift();
-        }
-
-        switch (newState) {
-            case 'OPEN':
-                this.nextAttempt = Date.now() + this.resetTimeout;
-                this.halfOpenCalls = 0;
-                this.successes = 0;
-                console.warn(`⚠️  Circuit breaker '${this.name}' OPENED (${this.failures} failures)`);
-                break;
+    onFailure() {
+        if (this._lockState()) {
+            try {
+                this.failures++;
                 
-            case 'HALF_OPEN':
-                this.halfOpenCalls = 0;
-                this.successes = 0;
-                console.log(`🔄 Circuit breaker '${this.name}' HALF-OPEN (testing recovery)`);
-                break;
+                // Track failure for partial recovery analysis
+                if (this.state === 'HALF_OPEN') {
+                    this.recoveryTestRequests.push({ success: false, timestamp: Date.now() });
+                    this.trimRecoveryWindow();
+                    
+                    // If we fail during recovery, go back to OPEN with updated backoff
+                    this.state = 'OPEN';
+                    console.log(`❌ [CircuitBreaker:${this.name}] Recovery attempt failed, returning to OPEN state`);
+                }
                 
-            case 'CLOSED':
-                this.failures = 0;
-                this.successes = 0;
-                this.halfOpenCalls = 0;
-                console.log(`✅ Circuit breaker '${this.name}' CLOSED (recovered)`);
-                break;
+                if (this.failures >= this.failureThreshold && this.state !== 'OPEN') {
+                    this.state = 'OPEN';
+                    this.nextAttempt = Date.now() + this.resetTimeout;
+                    this.resetRecoveryState();
+                    console.log(`🚫 [CircuitBreaker:${this.name}] Circuit breaker opened after ${this.failures} failures`);
+                }
+                
+                this.persistState();
+            } finally {
+                this._unlockState();
+            }
+        }
+    }
+
+    shouldFullyRecover() {
+        if (this.recoveryTestRequests.length < 3) {
+            return false; // Need at least 3 test requests
         }
         
-        // Call external state change callback
-        this.onStateChange(oldState, newState);
+        const successRate = this.getSuccessRate();
+        return successRate >= this.partialRecoveryThreshold;
     }
 
-    /**
-     * Force circuit breaker to open (manual intervention)
-     */
-    forceOpen(reason = 'Manual intervention') {
-        console.warn(`🚨 Circuit breaker '${this.name}' manually opened: ${reason}`);
-        this.setState('OPEN');
+    getSuccessRate() {
+        if (this.recoveryTestRequests.length === 0) return 0;
+        
+        const successCount = this.recoveryTestRequests.filter(req => req.success).length;
+        return (successCount / this.recoveryTestRequests.length) * 100;
     }
 
-    /**
-     * Force circuit breaker to close (manual intervention)
-     */
-    forceClose(reason = 'Manual intervention') {
-        console.log(`🔄 Circuit breaker '${this.name}' manually closed: ${reason}`);
+    trimRecoveryWindow() {
+        // Keep only the most recent requests within the window
+        if (this.recoveryTestRequests.length > this.partialRecoveryWindow) {
+            this.recoveryTestRequests = this.recoveryTestRequests.slice(-this.partialRecoveryWindow);
+        }
+    }
+
+    resetRecoveryState() {
         this.failures = 0;
-        this.setState('CLOSED');
-    }
-
-    /**
-     * Reset circuit breaker to initial state
-     */
-    reset() {
-        this.failures = 0;
-        this.successes = 0;
-        this.halfOpenCalls = 0;
+        this.recoveryAttempts = 0;
+        this.currentRetryDelay = this.baseRetryDelay;
+        this.recoveryTestRequests = [];
+        this.lastRecoveryAttempt = 0;
         this.nextAttempt = 0;
-        this.setState('CLOSED');
-        console.log(`🔄 Circuit breaker '${this.name}' reset`);
+    }
+
+    persistState() {
+        if (!this.persistStatePath) return;
+        
+        try {
+            const state = {
+                name: this.name,
+                state: this.state,
+                failures: this.failures,
+                nextAttempt: this.nextAttempt,
+                recoveryAttempts: this.recoveryAttempts,
+                currentRetryDelay: this.currentRetryDelay,
+                lastRecoveryAttempt: this.lastRecoveryAttempt,
+                recoveryTestRequests: this.recoveryTestRequests,
+                timestamp: Date.now()
+            };
+            
+            fs.writeFileSync(this.persistStatePath, JSON.stringify(state, null, 2));
+        } catch (error) {
+            console.warn(`⚠️ [CircuitBreaker:${this.name}] Failed to persist state:`, error.message);
+        }
+    }
+
+    loadPersistedState() {
+        if (!this.persistStatePath || !fs.existsSync(this.persistStatePath)) {
+            return;
+        }
+        
+        try {
+            const stateData = fs.readFileSync(this.persistStatePath, 'utf8');
+            const state = JSON.parse(stateData);
+            
+            // Only load state if it's for the same circuit breaker and recent
+            if (state.name === this.name && (Date.now() - state.timestamp) < 3600000) { // 1 hour max age
+                this.state = state.state || 'CLOSED';
+                this.failures = state.failures || 0;
+                this.nextAttempt = state.nextAttempt || 0;
+                this.recoveryAttempts = state.recoveryAttempts || 0;
+                this.currentRetryDelay = state.currentRetryDelay || this.baseRetryDelay;
+                this.lastRecoveryAttempt = state.lastRecoveryAttempt || 0;
+                this.recoveryTestRequests = state.recoveryTestRequests || [];
+                
+                console.log(`🔄 [CircuitBreaker:${this.name}] Loaded persisted state: ${this.state} (failures: ${this.failures}, attempts: ${this.recoveryAttempts})`);
+            }
+        } catch (error) {
+            console.warn(`⚠️ [CircuitBreaker:${this.name}] Failed to load persisted state:`, error.message);
+        }
+    }
+
+    getState() { 
+        return this._state; 
     }
     
-    /**
-     * Get current state
-     */
-    getState() {
-        return this.state;
-    }
-
-    /**
-     * Get current status
-     */
     getStatus() {
+        // Safe atomic read of status
         return {
             name: this.name,
-            state: this.state,
-            failures: this.failures,
-            successes: this.successes,
-            nextAttempt: this.nextAttempt,
-            halfOpenCalls: this.halfOpenCalls,
-            isOpen: this.state === 'OPEN',
-            isHalfOpen: this.state === 'HALF_OPEN',
-            isClosed: this.state === 'CLOSED',
-            stats: {
-                ...this.stats,
-                uptime: Date.now() - (this.stats.stateHistory[0]?.timestamp || Date.now()),
-                successRate: this.stats.requests > 0 ? (this.stats.successes / this.stats.requests) * 100 : 0
+            state: this._state,
+            failures: this._failures,
+            nextAttempt: this._nextAttempt,
+            recoveryAttempts: this.recoveryAttempts,
+            currentRetryDelay: this.currentRetryDelay,
+            successRate: this.getSuccessRate(),
+            timeToNextAttempt: Math.max(0, this._nextAttempt - Date.now())
+        };
+    }
+    
+    reset() {
+        if (this._lockState()) {
+            try {
+                this.resetRecoveryState();
+                this.state = 'CLOSED';
+                this.failures = 0;
+                this.nextAttempt = 0;
+                this.persistState();
+            } finally {
+                this._unlockState();
             }
-        };
-    }
-
-    /**
-     * Health check
-     */
-    async healthCheck() {
-        try {
-            const status = this.getStatus();
-            
-            return {
-                healthy: status.state !== 'OPEN',
-                state: status.state,
-                failures: status.failures,
-                successRate: status.stats.successRate,
-                lastFailure: status.stats.lastFailure,
-                lastSuccess: status.stats.lastSuccess,
-                timestamp: new Date().toISOString()
-            };
-        } catch (error) {
-            return {
-                healthy: false,
-                error: error.message,
-                timestamp: new Date().toISOString()
-            };
         }
-    }
-
-    /**
-     * Default monitor function (can be overridden)
-     */
-    defaultMonitor(event, data) {
-        // Basic logging and monitoring
-        if (event === 'failure' && this.failures > this.failureThreshold * 0.8) {
-            console.warn(`⚠️  Circuit breaker '${this.name}' approaching failure threshold (${this.failures}/${this.failureThreshold})`);
-        }
-    }
-
-    /**
-     * Export metrics for monitoring systems
-     */
-    getMetrics() {
-        const status = this.getStatus();
-        
-        return {
-            circuit_breaker_state: status.state,
-            circuit_breaker_failures: status.failures,
-            circuit_breaker_successes: status.successes,
-            circuit_breaker_requests_total: status.stats.requests,
-            circuit_breaker_requests_rejected: status.stats.rejected,
-            circuit_breaker_success_rate: status.stats.successRate,
-            circuit_breaker_state_changes: status.stats.stateChanges
-        };
     }
 }
 
-/**
- * Circuit Breaker Registry
- * Manages multiple circuit breakers and provides centralized monitoring
- */
 class CircuitBreakerRegistry {
-    constructor() {
+    constructor(options = {}) {
         this.breakers = new Map();
+        this.defaultOptions = {
+            failureThreshold: 5,
+            resetTimeout: 60000,
+            baseRetryDelay: 2000,
+            maxRetryDelay: 300000,
+            retryMultiplier: 2,
+            partialRecoveryThreshold: 0.5,
+            partialRecoveryWindow: 10,
+            persistStatePath: options.persistStatePath || './data/circuit-breaker-state',
+            ...options
+        };
+        
+        // Ensure persistence directory exists
+        this.ensurePersistenceDirectory();
     }
 
-    /**
-     * Create or get a circuit breaker
-     */
+    ensurePersistenceDirectory() {
+        if (this.defaultOptions.persistStatePath) {
+            try {
+                const dir = path.dirname(this.defaultOptions.persistStatePath);
+                if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                }
+            } catch (error) {
+                console.warn('⚠️ [CircuitBreakerRegistry] Failed to create persistence directory:', error.message);
+            }
+        }
+    }
+
     get(name, options = {}) {
         if (!this.breakers.has(name)) {
-            const breaker = new CircuitBreaker({ ...options, name });
-            this.breakers.set(name, breaker);
+            const breakerOptions = {
+                ...this.defaultOptions,
+                ...options,
+                name,
+                persistStatePath: this.defaultOptions.persistStatePath ? 
+                    `${this.defaultOptions.persistStatePath}-${name}.json` : null
+            };
+            
+            this.breakers.set(name, new CircuitBreaker(breakerOptions));
+            console.log(`🔧 [CircuitBreakerRegistry] Created circuit breaker: ${name}`);
         }
+        
         return this.breakers.get(name);
     }
 
-    /**
-     * Remove a circuit breaker
-     */
-    remove(name) {
-        return this.breakers.delete(name);
-    }
-
-    /**
-     * Get all circuit breakers
-     */
     getAll() {
         return Array.from(this.breakers.values());
     }
 
-    /**
-     * Get status of all circuit breakers
-     */
-    getAllStatus() {
-        const status = {};
-        for (const [name, breaker] of this.breakers) {
-            status[name] = breaker.getStatus();
-        }
-        return status;
-    }
-
-    /**
-     * Health check for all circuit breakers
-     */
-    async healthCheckAll() {
-        const checks = {};
-        
-        for (const [name, breaker] of this.breakers) {
-            checks[name] = await breaker.healthCheck();
-        }
-        
-        const allHealthy = Object.values(checks).every(check => check.healthy);
-        
-        return {
-            healthy: allHealthy,
-            breakers: checks,
-            timestamp: new Date().toISOString()
-        };
-    }
-
-    /**
-     * Force all circuit breakers to reset
-     */
     resetAll() {
-        for (const breaker of this.breakers.values()) {
-            breaker.reset();
-        }
-        console.log('🔄 All circuit breakers reset');
+        console.log(`🔄 [CircuitBreakerRegistry] Resetting ${this.breakers.size} circuit breakers`);
+        this.breakers.forEach(breaker => breaker.reset());
     }
 
-    /**
-     * Get aggregated metrics
-     */
-    getMetrics() {
-        const metrics = {};
+    async attemptGlobalRecovery() {
+        console.log('🔄 [CircuitBreakerRegistry] Starting global circuit breaker recovery...');
         
-        for (const [name, breaker] of this.breakers) {
-            const breakerMetrics = breaker.getMetrics();
-            for (const [key, value] of Object.entries(breakerMetrics)) {
-                metrics[`${name}_${key}`] = value;
+        const results = [];
+        const openBreakers = Array.from(this.breakers.values()).filter(b => b.state === 'OPEN');
+        
+        if (openBreakers.length === 0) {
+            return {
+                success: true,
+                attempted: 0,
+                waiting: 0,
+                total: 0,
+                results: []
+            };
+        }
+        
+        console.log(`🔍 [CircuitBreakerRegistry] Found ${openBreakers.length} open circuit breakers to recover`);
+        
+        let attempted = 0;
+        let waiting = 0;
+        
+        for (const breaker of openBreakers) {
+            try {
+                // Perform health check if available
+                const isHealthy = await breaker.performHealthCheck();
+                
+                if (!isHealthy) {
+                    const timeToNext = Math.max(0, breaker.nextAttempt - Date.now());
+                    results.push({
+                        name: breaker.name,
+                        status: 'health_check_failed',
+                        timeToNext: Math.round(timeToNext / 1000) + 's',
+                        error: 'Health check failed'
+                    });
+                    waiting++;
+                    continue;
+                }
+                
+                if (breaker.shouldAttemptRecovery()) {
+                    const success = breaker.attemptGradualRecovery();
+                    if (success) {
+                        results.push({
+                            name: breaker.name,
+                            status: 'attempted',
+                            state: breaker.state,
+                            recoveryAttempts: breaker.recoveryAttempts
+                        });
+                        attempted++;
+                    } else {
+                        results.push({
+                            name: breaker.name,
+                            status: 'failed',
+                            error: 'Recovery attempt failed'
+                        });
+                    }
+                } else {
+                    const timeToNext = Math.max(0, breaker.nextAttempt - Date.now());
+                    results.push({
+                        name: breaker.name,
+                        status: 'waiting',
+                        timeToNext: Math.round(timeToNext / 1000) + 's'
+                    });
+                    waiting++;
+                }
+            } catch (error) {
+                console.error(`❌ [CircuitBreakerRegistry] Error during recovery of ${breaker.name}:`, error.message);
+                results.push({
+                    name: breaker.name,
+                    status: 'failed',
+                    error: error.message
+                });
             }
         }
         
-        return metrics;
+        const success = attempted > 0 || waiting === openBreakers.length;
+        
+        console.log(`🔄 [CircuitBreakerRegistry] Global recovery completed: ${attempted} attempted, ${waiting} waiting, ${openBreakers.length} total`);
+        
+        return {
+            success,
+            attempted,
+            waiting,
+            total: openBreakers.length,
+            results
+        };
+    }
+
+    async healthCheckAll() {
+        const allBreakers = Array.from(this.breakers.values());
+        const results = [];
+        
+        if (allBreakers.length === 0) {
+            return {
+                healthy: true,
+                totalBreakers: 0,
+                healthyBreakers: 0,
+                unhealthyBreakers: 0,
+                results: []
+            };
+        }
+        
+        let healthyCount = 0;
+        let unhealthyCount = 0;
+        
+        for (const breaker of allBreakers) {
+            try {
+                const isHealthy = await breaker.performHealthCheck();
+                const status = breaker.getStatus();
+                
+                // Calculate failure rate over time
+                const recentFailures = breaker.recoveryTestRequests
+                    .filter(req => !req.success && (Date.now() - req.timestamp) < 300000) // Last 5 minutes
+                    .length;
+                const totalRecent = breaker.recoveryTestRequests
+                    .filter(req => (Date.now() - req.timestamp) < 300000)
+                    .length;
+                
+                const averageFailureRate = totalRecent > 0 ? (recentFailures / totalRecent) * 100 : 0;
+                
+                const healthy = breaker.state === 'CLOSED' && isHealthy && averageFailureRate < 50;
+                
+                results.push({
+                    name: breaker.name,
+                    healthy,
+                    state: breaker.state,
+                    failures: breaker.failures,
+                    recoveryAttempts: breaker.recoveryAttempts,
+                    averageFailureRate,
+                    healthCheckPassed: isHealthy
+                });
+                
+                if (healthy) {
+                    healthyCount++;
+                } else {
+                    unhealthyCount++;
+                }
+            } catch (error) {
+                console.error(`❌ [CircuitBreakerRegistry] Health check error for ${breaker.name}:`, error.message);
+                results.push({
+                    name: breaker.name,
+                    healthy: false,
+                    error: error.message
+                });
+                unhealthyCount++;
+            }
+        }
+        
+        const overallHealthy = unhealthyCount === 0;
+        
+        return {
+            healthy: overallHealthy,
+            totalBreakers: allBreakers.length,
+            healthyBreakers: healthyCount,
+            unhealthyBreakers: unhealthyCount,
+            results
+        };
+    }
+
+    getStatus() {
+        const breakerStatuses = Array.from(this.breakers.entries()).map(([name, breaker]) => ({
+            name,
+            ...breaker.getStatus()
+        }));
+        
+        const openCount = breakerStatuses.filter(s => s.state === 'OPEN').length;
+        const halfOpenCount = breakerStatuses.filter(s => s.state === 'HALF_OPEN').length;
+        const closedCount = breakerStatuses.filter(s => s.state === 'CLOSED').length;
+        
+        return {
+            totalBreakers: this.breakers.size,
+            openBreakers: openCount,
+            halfOpenBreakers: halfOpenCount,
+            closedBreakers: closedCount,
+            breakers: breakerStatuses
+        };
+    }
+
+    remove(name) {
+        const removed = this.breakers.delete(name);
+        if (removed) {
+            console.log(`🗑️ [CircuitBreakerRegistry] Removed circuit breaker: ${name}`);
+        }
+        return removed;
+    }
+
+    clear() {
+        const count = this.breakers.size;
+        this.breakers.clear();
+        console.log(`🗑️ [CircuitBreakerRegistry] Cleared ${count} circuit breakers`);
     }
 }
 
-// Global registry instance
+// Create a singleton registry instance
 const registry = new CircuitBreakerRegistry();
 
-module.exports = {
-    CircuitBreaker,
-    CircuitBreakerRegistry,
-    registry
-};
+module.exports = { CircuitBreaker, CircuitBreakerRegistry, registry };

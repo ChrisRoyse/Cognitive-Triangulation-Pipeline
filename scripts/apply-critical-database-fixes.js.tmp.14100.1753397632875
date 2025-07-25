@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+
+/**
+ * Apply Critical Database Schema Fixes
+ * 
+ * This script applies Migration 005 to fix all critical database schema issues
+ * identified by the validation agents.
+ */
+
+const path = require('path');
+const { initializeDb } = require('../src/utils/initializeDb');
+const { Migration005 } = require('../migrations/005_fix_database_schema_critical_issues');
+
+async function applyCriticalFixes() {
+    console.log('🔧 Applying Critical Database Schema Fixes...');
+    console.log('==================================================');
+    
+    try {
+        // Initialize database connection
+        console.log('📊 Initializing database connection...');
+        const { db } = await initializeDb();
+        
+        // Create migration instance
+        const migration = new Migration005(db);
+        
+        // Check if migration is needed
+        console.log('🔍 Checking if migration is needed...');
+        const isNeeded = migration.isNeeded();
+        
+        if (!isNeeded) {
+            console.log('✅ Migration not needed - all fixes already applied');
+            return;
+        }
+        
+        console.log('⚡ Migration needed - applying fixes...');
+        
+        // Get stats before migration
+        const statsBefore = migration.getStats();
+        console.log('📊 Database stats before migration:', statsBefore);
+        
+        // Apply migration
+        console.log('🔄 Applying Migration 005...');
+        migration.up();
+        
+        // Validate migration
+        console.log('🔍 Validating migration...');
+        migration.validate();
+        
+        // Get stats after migration
+        const statsAfter = migration.getStats();
+        console.log('📊 Database stats after migration:', statsAfter);
+        
+        // Show improvement summary
+        if (statsBefore && statsAfter) {
+            console.log('\n📈 Migration Summary:');
+            console.log(`   Relationship Evidence Records: ${statsBefore.relationshipEvidence} → ${statsAfter.relationshipEvidence}`);
+            console.log(`   Records with Relationship ID: ${statsBefore.relationshipEvidenceWithId} → ${statsAfter.relationshipEvidenceWithId}`);
+            console.log(`   Tracking Records: ${statsBefore.trackingRecords} → ${statsAfter.trackingRecords}`);
+            console.log(`   Total Indexes: ${statsBefore.indexCount} → ${statsAfter.indexCount}`);
+        }
+        
+        console.log('\n✅ Critical database schema fixes applied successfully!');
+        console.log('🎯 The following issues have been resolved:');
+        console.log('   ✓ Fixed relationship_evidence.relationship_id NULL issues');
+        console.log('   ✓ Added missing performance indexes');
+        console.log('   ✓ Created relationship_evidence_tracking table');
+        console.log('   ✓ Fixed data integrity issues');
+        console.log('   ✓ Added Neo4j ingestion optimization');
+        
+    } catch (error) {
+        console.error('❌ Error applying critical database fixes:', error);
+        console.error('Stack trace:', error.stack);
+        process.exit(1);
+    }
+}
+
+// Run if called directly
+if (require.main === module) {
+    applyCriticalFixes()
+        .then(() => {
+            console.log('\n🏁 Script completed successfully');
+            process.exit(0);
+        })
+        .catch(error => {
+            console.error('\n💥 Script failed:', error);
+            process.exit(1);
+        });
+}
+
+module.exports = { applyCriticalFixes };

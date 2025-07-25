@@ -1,6 +1,7 @@
 const { Worker } = require('bullmq');
 const ConfidenceScoringService = require('../services/cognitive_triangulation/ConfidenceScoringService');
 const { ManagedWorker } = require('./ManagedWorker');
+const { PipelineConfig } = require('../config/pipelineConfig');
 
 class ReconciliationWorker {
     constructor(queueManager, dbManager, workerPoolManager, options = {}) {
@@ -8,17 +9,22 @@ class ReconciliationWorker {
         this.dbManager = dbManager;
         this.workerPoolManager = workerPoolManager;
         
+        // Use centralized configuration
+        this.config = options.pipelineConfig || PipelineConfig.createDefault();
+        const workerLimit = this.config.getWorkerLimit('reconciliation');
+        
         if (!options.processOnly) {
             if (workerPoolManager) {
                 // Create managed worker with intelligent concurrency control
                 this.managedWorker = new ManagedWorker('reconciliation-queue', workerPoolManager, {
                     workerType: 'reconciliation',
-                    baseConcurrency: 8, // Good concurrency for reconciliation
-                    maxConcurrency: 25,
+                    baseConcurrency: Math.min(5, workerLimit), // Good concurrency for reconciliation
+                    maxConcurrency: workerLimit,
                     minConcurrency: 2,
-                    rateLimitRequests: 20, // Higher rate for reconciliation processing
-                    rateLimitWindow: 1000,
-                    failureThreshold: 5,
+                    // Rate limiting removed - only global 100 agent limit matters
+                    // rateLimitRequests: 20, // Higher rate for reconciliation processing
+                    // rateLimitWindow: 1000,
+                    failureThreshold: 10, // Increased from 5 to be less aggressive
                     resetTimeout: 60000,
                     jobTimeout: 180000, // 3 minutes for reconciliation
                     retryAttempts: 3,
@@ -32,7 +38,7 @@ class ReconciliationWorker {
                 // Fallback to basic worker if no WorkerPoolManager
                 this.worker = new Worker('reconciliation-queue', this.process.bind(this), {
                     connection: this.queueManager.connection,
-                    concurrency: 5
+                    concurrency: workerLimit // Use centralized config
                 });
             }
         }
@@ -80,7 +86,7 @@ class ReconciliationWorker {
             // Update existing relationships to VALIDATED status
             const updateResult = db.prepare(
                 `UPDATE relationships 
-                 SET status = 'VALIDATED', confidence_score = ?
+                 SET status = 'VALIDATED', confidence = ?
                  WHERE id IN (
                      SELECT DISTINCT re.relationship_id 
                      FROM relationship_evidence re 
@@ -97,7 +103,7 @@ class ReconciliationWorker {
             // Mark relationships as DISCARDED for low confidence
             const discardResult = db.prepare(
                 `UPDATE relationships 
-                 SET status = 'DISCARDED', confidence_score = ?
+                 SET status = 'DISCARDED', confidence = ?
                  WHERE id IN (
                      SELECT DISTINCT re.relationship_id 
                      FROM relationship_evidence re 

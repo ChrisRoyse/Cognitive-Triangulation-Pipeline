@@ -34,8 +34,8 @@ describe('RelationshipResolver Agent - Functional Tests', () => {
             { id: 'file5', project_id: 'proj1', path: 'dir3/fileE.js', checksum: 'mno', language: 'javascript' },
         ];
         const pois = [
-            { id: 'poi1', file_id: 'file1', type: 'function', name: 'funcA', description: '...', line_number: 1 },
-            { id: 'poi3', file_id: 'file3', type: 'function', name: 'funcC', description: '...', line_number: 1 },
+            { id: 'poi1', file_id: 'file1', type: 'function', name: 'funcA', description: '...', start_line: 1 },
+            { id: 'poi3', file_id: 'file3', type: 'function', name: 'funcC', description: '...', start_line: 1 },
         ];
         seedData(db, { files, pois });
         const resolver = new RelationshipResolver(db, 'test-api-key');
@@ -61,9 +61,9 @@ describe('RelationshipResolver Agent - Functional Tests', () => {
             { id: 'file3', project_id: 'proj1', path: `dir2${path.sep}fileC.js`, checksum: 'ghi', language: 'javascript' },
         ];
         const pois = [
-            { id: 'poi1', file_id: 'file1', type: 'function', name: 'funcA', description: '...', line_number: 1 },
-            { id: 'poi2', file_id: 'file2', type: 'function', name: 'funcB', description: '...', line_number: 1 },
-            { id: 'poi3', file_id: 'file3', type: 'function', name: 'funcC', description: '...', line_number: 1 },
+            { id: 'poi1', file_id: 'file1', type: 'function', name: 'funcA', description: '...', start_line: 1 },
+            { id: 'poi2', file_id: 'file2', type: 'function', name: 'funcB', description: '...', start_line: 1 },
+            { id: 'poi3', file_id: 'file3', type: 'function', name: 'funcC', description: '...', start_line: 1 },
         ];
         seedData(db, { files, pois });
         const resolver = new RelationshipResolver(db, 'test-api-key');
@@ -89,8 +89,8 @@ describe('RelationshipResolver Agent - Functional Tests', () => {
         const fileId = 'file1';
         const files = [{ id: fileId, path: 'dir1/fileA.js', checksum: 'abc', language: 'javascript' }];
         const poisInFile = [
-            { id: 'poi1', file_id: fileId, type: 'function', name: 'doWork', description: 'function doWork() { helper(); }', line_number: 1 },
-            { id: 'poi2', file_id: fileId, type: 'function', name: 'helper', description: 'function helper() {}', line_number: 2 },
+            { id: 'poi1', file_id: fileId, type: 'function', name: 'doWork', description: 'function doWork() { helper(); }', start_line: 1 },
+            { id: 'poi2', file_id: fileId, type: 'function', name: 'helper', description: 'function helper() {}', start_line: 2 },
         ];
         seedData(db, { files, pois: poisInFile });
         const resolver = new RelationshipResolver(db, 'test-api-key');
@@ -128,8 +128,8 @@ describe('RelationshipResolver Agent - Functional Tests', () => {
         // Arrange
         const fileId = 'file1';
         const poisInFile = [
-            { id: 'poi1', file_id: fileId, type: 'variable', name: 'config', description: 'const config = {}', line_number: 1 },
-            { id: 'poi2', file_id: fileId, type: 'function', name: 'unused', description: 'function unused() {}', line_number: 2 },
+            { id: 'poi1', file_id: fileId, type: 'variable', name: 'config', description: 'const config = {}', start_line: 1 },
+            { id: 'poi2', file_id: fileId, type: 'function', name: 'unused', description: 'function unused() {}', start_line: 2 },
         ];
         const resolver = new RelationshipResolver(db, 'test-api-key');
 

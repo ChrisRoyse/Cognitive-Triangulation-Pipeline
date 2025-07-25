@@ -26,12 +26,12 @@ const analysisSchema = {
       items: {
         type: 'object',
         properties: {
-          sourcePoiId: { type: 'string' },
-          targetPoiId: { type: 'string' },
+          source_poi_id: { type: 'string' },
+          target_poi_id: { type: 'string' },
           type: { type: 'string' },
           filePath: { type: 'string' },
         },
-        required: ['sourcePoiId', 'targetPoiId', 'type', 'filePath'],
+        required: ['source_poi_id', 'target_poi_id', 'type', 'filePath'],
         additionalProperties: false,
       },
     },

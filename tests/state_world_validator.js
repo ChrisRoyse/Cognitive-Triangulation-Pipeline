@@ -29,7 +29,7 @@ const EXPECTED_STATE = {
         tables: {
             files: { minRows: 13, columns: ['id', 'file_path', 'hash', 'status', 'created_at', 'updated_at'] },
             pois: { minRows: 300, columns: ['id', 'file_path', 'name', 'type', 'start_line', 'end_line', 'llm_output', 'hash'] },
-            relationships: { minRows: 1600, columns: ['id', 'source_poi_id', 'target_poi_id', 'type', 'file_path', 'status', 'confidence_score'] },
+            relationships: { minRows: 1600, columns: ['id', 'source_poi_id', 'target_poi_id', 'type', 'file_path', 'status', 'confidence'] },
             directory_summaries: { minRows: 1, columns: ['id', 'directory_path', 'summary', 'file_count'] },
             relationship_evidence: { minRows: 100, columns: ['id', 'source_poi_id', 'target_poi_id', 'relationship_type', 'evidence_type', 'confidence'] },
             outbox: { minRows: 50, columns: ['id', 'event_type', 'aggregate_id', 'payload', 'created_at', 'processed_at', 'status'] }
@@ -473,7 +473,7 @@ class StateWorldValidator {
     async validateRelationshipData() {
         return new Promise((resolve, reject) => {
             this.sqlite.all(`
-                SELECT type, COUNT(*) as count, AVG(confidence_score) as avg_confidence
+                SELECT type, COUNT(*) as count, AVG(confidence) as avg_confidence
                 FROM relationships 
                 GROUP BY type
             `, (err, rows) => {

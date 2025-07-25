@@ -34,18 +34,17 @@ class ManagedWorker extends EventEmitter {
             maxConcurrency: options.maxConcurrency || 50,
             minConcurrency: options.minConcurrency || 1,
             
-            // Rate limiting
-            rateLimitRequests: options.rateLimitRequests || 10,
-            rateLimitWindow: options.rateLimitWindow || 1000,
+            // Rate limiting removed - only global 100 agent limit matters
+            // rateLimitRequests: options.rateLimitRequests || 10,
+            // rateLimitWindow: options.rateLimitWindow || 1000,
             
             // Circuit breaker settings
             failureThreshold: options.failureThreshold || 5,
             resetTimeout: options.resetTimeout || 60000,
             
-            // Performance settings
-            jobTimeout: options.jobTimeout || 300000, // 5 minutes
-            retryAttempts: options.retryAttempts || 3,
-            retryDelay: options.retryDelay || 5000,
+            // No jobTimeout - allow unlimited time for large codebases
+            retryAttempts: options.retryAttempts || 2, // Reduced from 3 to 2 for alignment
+            retryDelay: options.retryDelay || 3000, // Reduced from 5000 to 3000 for faster retries
             
             // Health monitoring
             enableHealthCheck: options.enableHealthCheck !== false,
@@ -78,9 +77,41 @@ class ManagedWorker extends EventEmitter {
             lastHealthCheck: null
         };
         
-        // Timers
-        this.healthCheckTimer = null;
-        this.metricsTimer = null;
+        // Timers with atomic management
+        this.timers = {
+            healthCheck: null,
+            metrics: null,
+            // Atomic timer operations
+            set(name, timerId) {
+                if (this[name] === null) {
+                    this[name] = timerId;
+                    return true;
+                }
+                return false; // Timer already set
+            },
+            clear(name) {
+                const timerId = this[name];
+                if (timerId !== null) {
+                    clearInterval(timerId);
+                    this[name] = null;
+                    return true;
+                }
+                return false; // No timer to clear
+            },
+            clearAll() {
+                const toClean = [];
+                // Atomically collect all timers
+                Object.keys(this).forEach(key => {
+                    if (key !== 'set' && key !== 'clear' && key !== 'clearAll' && this[key] !== null) {
+                        toClean.push({name: key, id: this[key]});
+                        this[key] = null;
+                    }
+                });
+                // Clear them outside the critical section
+                toClean.forEach(timer => clearInterval(timer.id));
+                return toClean.length;
+            }
+        };
         
         this.logger.info('ManagedWorker created', {
             workerId: this.config.workerId,
@@ -103,9 +134,10 @@ class ManagedWorker extends EventEmitter {
                 maxConcurrency: this.config.maxConcurrency,
                 minConcurrency: this.config.minConcurrency,
                 failureThreshold: this.config.failureThreshold,
-                resetTimeout: this.config.resetTimeout,
-                rateLimitRequests: this.config.rateLimitRequests,
-                rateLimitWindow: this.config.rateLimitWindow
+                resetTimeout: this.config.resetTimeout
+                // Rate limiting removed - only global 100 agent limit matters
+                // rateLimitRequests: this.config.rateLimitRequests,
+                // rateLimitWindow: this.config.rateLimitWindow
             });
             
             // Create BullMQ worker with managed concurrency
@@ -191,11 +223,8 @@ class ManagedWorker extends EventEmitter {
                 
                 console.log(`🔄 [${this.workerType}] Processing job ${jobId} (attempt ${job.attemptsMade + 1})`);
                 
-                // Execute original processor with timeout
-                const result = await this.executeWithTimeout(
-                    () => originalProcessor(job),
-                    this.config.jobTimeout
-                );
+                // Execute original processor without timeout (unlimited time for large codebases)
+                const result = await originalProcessor(job);
                 
                 // Success
                 const processingTime = Date.now() - startTime;
@@ -224,20 +253,32 @@ class ManagedWorker extends EventEmitter {
     }
 
     /**
-     * Execute function with timeout
+     * Execute function with timeout (race condition safe)
      */
     async executeWithTimeout(fn, timeout) {
         return new Promise(async (resolve, reject) => {
+            let timeoutCleared = false;
+            
             const timeoutId = setTimeout(() => {
-                reject(new Error(`Job timeout after ${timeout}ms`));
+                if (!timeoutCleared) {
+                    timeoutCleared = true;
+                    reject(new Error(`Job timeout after ${timeout}ms`));
+                }
             }, timeout);
+            
+            const clearTimeoutSafe = () => {
+                if (!timeoutCleared) {
+                    timeoutCleared = true;
+                    clearTimeout(timeoutId);
+                }
+            };
             
             try {
                 const result = await fn();
-                clearTimeout(timeoutId);
+                clearTimeoutSafe();
                 resolve(result);
             } catch (error) {
-                clearTimeout(timeoutId);
+                clearTimeoutSafe();
                 reject(error);
             }
         });
@@ -394,10 +435,10 @@ class ManagedWorker extends EventEmitter {
     }
 
     /**
-     * Start health monitoring
+     * Start health monitoring (race condition safe)
      */
     startHealthMonitoring() {
-        this.healthCheckTimer = setInterval(async () => {
+        const timerId = setInterval(async () => {
             try {
                 const health = await this.performHealthCheck();
                 this.metrics.lastHealthCheck = Date.now();
@@ -412,7 +453,12 @@ class ManagedWorker extends EventEmitter {
             }
         }, this.config.healthCheckInterval);
         
-        console.log(`🏥 [${this.workerType}] Health monitoring started`);
+        if (this.timers.set('healthCheck', timerId)) {
+            console.log(`🏥 [${this.workerType}] Health monitoring started`);
+        } else {
+            clearInterval(timerId);
+            console.warn(`⚠️  [${this.workerType}] Health monitoring already running`);
+        }
     }
 
     /**
@@ -435,17 +481,9 @@ class ManagedWorker extends EventEmitter {
         }
         
         // Check processing time
-        if (this.metrics.avgProcessingTime > this.config.jobTimeout * 0.8) {
-            issues.push(`High processing time: ${this.metrics.avgProcessingTime.toFixed(0)}ms`);
-        }
+        // No job timeout limits - allow unlimited processing time
         
-        // Check stalled jobs
-        const stalledJobs = Array.from(this.activeJobs.values())
-            .filter(job => Date.now() - job.startTime > this.config.jobTimeout);
-        
-        if (stalledJobs.length > 0) {
-            issues.push(`${stalledJobs.length} stalled jobs`);
-        }
+        // No stalled job detection - jobs can take unlimited time
         
         return {
             healthy: issues.length === 0,
@@ -456,10 +494,10 @@ class ManagedWorker extends EventEmitter {
     }
 
     /**
-     * Start metrics reporting
+     * Start metrics reporting (race condition safe)
      */
     startMetricsReporting() {
-        this.metricsTimer = setInterval(() => {
+        const timerId = setInterval(() => {
             const metrics = this.getMetrics();
             
             console.log(`📊 [${this.workerType}] Metrics - Jobs: ${metrics.totalJobs}, Success Rate: ${metrics.successRate.toFixed(1)}%, Avg Time: ${metrics.avgProcessingTime.toFixed(0)}ms`);
@@ -467,7 +505,12 @@ class ManagedWorker extends EventEmitter {
             this.emit('metrics', metrics);
         }, this.config.metricsReportInterval);
         
-        console.log(`📊 [${this.workerType}] Metrics reporting started`);
+        if (this.timers.set('metrics', timerId)) {
+            console.log(`📊 [${this.workerType}] Metrics reporting started`);
+        } else {
+            clearInterval(timerId);
+            console.warn(`⚠️  [${this.workerType}] Metrics reporting already running`);
+        }
     }
 
     /**
@@ -525,15 +568,10 @@ class ManagedWorker extends EventEmitter {
         console.log(`🛑 [${this.workerType}] Starting graceful shutdown...`);
         
         try {
-            // Stop timers
-            if (this.healthCheckTimer) {
-                clearInterval(this.healthCheckTimer);
-                this.healthCheckTimer = null;
-            }
-            
-            if (this.metricsTimer) {
-                clearInterval(this.metricsTimer);
-                this.metricsTimer = null;
+            // Stop timers atomically
+            const clearedTimers = this.timers.clearAll();
+            if (clearedTimers > 0) {
+                console.log(`🛑 [${this.workerType}] Cleaned up ${clearedTimers} timers`);
             }
             
             // Wait for active jobs to complete (with timeout)
@@ -578,9 +616,11 @@ class ManagedWorker extends EventEmitter {
         
         this.isShuttingDown = true;
         
-        // Clear timers
-        if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
-        if (this.metricsTimer) clearInterval(this.metricsTimer);
+        // Clear timers atomically
+        const clearedTimers = this.timers.clearAll();
+        if (clearedTimers > 0) {
+            console.log(`🔥 [${this.workerType}] Force cleared ${clearedTimers} timers`);
+        }
         
         // Force close worker
         if (this.worker) {

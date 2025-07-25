@@ -66,7 +66,7 @@ describe('SelfCleaningAgent Integration Tests', () => {
                 name TEXT NOT NULL,
                 type TEXT NOT NULL,
                 description TEXT,
-                line_number INTEGER,
+                start_line INTEGER,
                 is_exported BOOLEAN DEFAULT FALSE,
                 FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
             );

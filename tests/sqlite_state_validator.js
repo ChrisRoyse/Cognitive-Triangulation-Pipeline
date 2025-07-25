@@ -129,7 +129,7 @@ class SQLiteStateValidator {
         const expectedSchemas = {
             files: ['id', 'file_path', 'hash', 'last_processed', 'status'],
             pois: ['id', 'file_path', 'name', 'type', 'start_line', 'end_line', 'llm_output', 'hash'],
-            relationships: ['id', 'source_poi_id', 'target_poi_id', 'type', 'file_path', 'status', 'confidence_score'],
+            relationships: ['id', 'source_poi_id', 'target_poi_id', 'type', 'file_path', 'status', 'confidence'],
             directory_summaries: ['id', 'directory_path', 'summary', 'created_at'],
             relationship_evidence: ['id', 'relationship_id', 'evidence_type', 'evidence_data', 'confidence'],
             outbox: ['id', 'event_type', 'payload', 'status', 'created_at', 'processed_at']
@@ -312,8 +312,8 @@ class SQLiteStateValidator {
             // Check confidence scores
             const invalidConfidence = this.db.prepare(`
                 SELECT COUNT(*) as count FROM relationships 
-                WHERE confidence_score IS NOT NULL 
-                  AND (confidence_score < 0 OR confidence_score > 1)
+                WHERE confidence IS NOT NULL 
+                  AND (confidence < 0 OR confidence > 1)
             `).get();
             
             if (invalidConfidence.count > 0) {

@@ -27,7 +27,7 @@ class GlobalConcurrencyManager extends EventEmitter {
             permitTimeout: options.permitTimeout || 0, // 0 = no timeout
             enablePriorities: options.enablePriorities !== false,
             enableFairScheduling: options.enableFairScheduling || false,
-            queueSizeLimit: options.queueSizeLimit || 1000,
+            queueSizeLimit: options.queueSizeLimit || 100000, // Support very large codebases
             metricsInterval: options.metricsInterval || 60000
         };
         
@@ -220,6 +220,11 @@ class GlobalConcurrencyManager extends EventEmitter {
         }
         
         this.metrics.totalQueued++;
+        
+        // Monitor queue depth
+        if (this.queue.length > 50000) {
+            console.warn(`⚠️ GlobalConcurrencyManager queue depth high: ${this.queue.length} jobs waiting`);
+        }
         
         // Emit event
         this.emit('permitQueued', {
@@ -470,12 +475,21 @@ class GlobalConcurrencyManager extends EventEmitter {
      */
     startMetricsCollection() {
         this.historyInterval = setInterval(() => {
+            const queueLength = this.queue.length;
+            
             this.history.push({
                 timestamp: Date.now(),
                 concurrency: this.getCurrentConcurrency(),
-                queueLength: this.queue.length,
+                queueLength: queueLength,
                 utilization: (this.getCurrentConcurrency() / this.config.maxConcurrency) * 100
             });
+            
+            // Monitor queue depth periodically
+            if (queueLength > 50000) {
+                console.warn(`⚠️ GlobalConcurrencyManager queue depth high: ${queueLength} jobs waiting`);
+            } else if (queueLength > 10000) {
+                console.log(`📊 GlobalConcurrencyManager queue depth: ${queueLength} jobs waiting`);
+            }
             
             // Keep last hour of data
             const cutoff = Date.now() - 3600000;

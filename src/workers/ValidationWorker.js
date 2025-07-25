@@ -1,57 +1,36 @@
 const { Worker } = require('bullmq');
 const { ManagedWorker } = require('./ManagedWorker');
+const { PipelineConfig } = require('../config/pipelineConfig');
 
 class ValidationWorker {
-    constructor(queueManager, dbManager, cacheClient, workerPoolManager, options = {}) {
+    constructor(queueManager, dbManager, workerPoolManager, options = {}) {
         this.queueManager = queueManager;
         this.dbManager = dbManager;
-        this.cacheClient = cacheClient;
         this.workerPoolManager = workerPoolManager;
         this.reconciliationQueue = this.queueManager.getQueue('reconciliation-queue');
+        
+        // Use centralized configuration
+        this.config = options.pipelineConfig || PipelineConfig.createDefault();
+        const workerLimit = this.config.getWorkerLimit('validation');
 
-        // Define the Lua script for atomic evidence counting and checking
-        this.cacheClient.defineCommand('checkAndFetchReadyRelationships', {
-            numberOfKeys: 1,
-            lua: `
-                local runId = KEYS[1]
-                local relationships = ARGV
-                local readyForReconciliation = {}
-                
-                for i=1, #relationships do
-                    local relHash = relationships[i]
-                    local evidenceCountKey = "evidence_count:" .. runId .. ":" .. relHash
-                    local currentCount = redis.call("INCR", evidenceCountKey)
-                    
-                    local relMapKey = "run:" .. runId .. ":rel_map"
-                    local expectedCountStr = redis.call("HGET", relMapKey, relHash)
-                    
-                    if expectedCountStr then
-                        local expectedCount = tonumber(expectedCountStr)
-                        if currentCount >= expectedCount then
-                            table.insert(readyForReconciliation, relHash)
-                        end
-                    end
-                end
-                
-                return readyForReconciliation
-            `,
-        });
+        // Note: ValidationWorker Redis coordination disabled for no-cache pipeline
 
         if (!options.processOnly) {
             if (workerPoolManager) {
                 // Create managed worker with intelligent concurrency control
                 this.managedWorker = new ManagedWorker('analysis-findings-queue', workerPoolManager, {
                     workerType: 'validation',
-                    baseConcurrency: 5, // Can handle more validation tasks
-                    maxConcurrency: 20,
+                    baseConcurrency: Math.min(5, workerLimit), // Can handle more validation tasks
+                    maxConcurrency: workerLimit,
                     minConcurrency: 1,
-                    rateLimitRequests: 15, // Higher rate for validation
-                    rateLimitWindow: 1000,
-                    failureThreshold: 5,
+                    // Rate limiting removed - only global 100 agent limit matters
+                    // rateLimitRequests: 15, // Higher rate for validation
+                    // rateLimitWindow: 1000,
+                    failureThreshold: 10, // Increased from 5 to be less aggressive
                     resetTimeout: 60000,
-                    jobTimeout: 120000, // 2 minutes for validation
-                    retryAttempts: 3,
-                    retryDelay: 8000,
+                    jobTimeout: 150000, // 2.5 minutes for validation (aligned with ManagedWorker default)
+                    retryAttempts: 2, // Reduced from 3 to 2 for alignment
+                    retryDelay: 3000, // Reduced from 8000 to 3000 for faster retries
                     ...options
                 });
                 
@@ -61,7 +40,7 @@ class ValidationWorker {
                 // Fallback to basic worker if no WorkerPoolManager
                 this.worker = new Worker('analysis-findings-queue', this.process.bind(this), {
                     connection: this.queueManager.connection,
-                    concurrency: 1, // Concurrency is now handled by batching, not multiple workers
+                    concurrency: workerLimit // Use centralized config
                 });
             }
         }
@@ -106,7 +85,7 @@ class ValidationWorker {
         console.log(`[ValidationWorker] Processing batch of ${relationships.length} findings for run ${runId}`);
 
         const db = this.dbManager.getDb();
-        const redis = this.cacheClient;
+        // const redis = this.cacheClient; // Disabled for no-cache pipeline
 
         // 1. Batch insert all evidence into SQLite in a single transaction
         const insert = db.prepare('INSERT INTO relationship_evidence (run_id, relationship_hash, evidence_payload) VALUES (?, ?, ?)');
@@ -126,18 +105,45 @@ class ValidationWorker {
             return;
         }
 
-        // 2. Use the Lua script to atomically update counts and get a list of ready relationships
+        // 2. No-cache pipeline: directly mark all relationships as ready for reconciliation
+        // Since we're not using Redis caching, we can directly process all relationships
         const relationshipHashes = relationships.map(r => r.relationshipHash);
-        const readyHashes = await redis.checkAndFetchReadyRelationships(runId, ...relationshipHashes);
-
-        // 3. Enqueue the ready relationships for reconciliation in a single bulk operation
-        if (readyHashes && readyHashes.length > 0) {
-            console.log(`[ValidationWorker] Found ${readyHashes.length} relationships ready for reconciliation.`);
-            const reconciliationJobs = readyHashes.map(hash => ({
+        
+        console.log(`[ValidationWorker] No-cache mode: Directly processing ${relationshipHashes.length} relationships for reconciliation.`);
+        
+        // 3. Enqueue all relationships for reconciliation in a single bulk operation
+        if (relationshipHashes && relationshipHashes.length > 0) {
+            const reconciliationJobs = relationshipHashes.map(hash => ({
                 name: 'reconcile-relationship',
                 data: { runId, relationshipHash: hash },
             }));
-            await this.reconciliationQueue.addBulk(reconciliationJobs);
+            
+            try {
+                await this.reconciliationQueue.addBulk(reconciliationJobs);
+                console.log(`[ValidationWorker] Successfully enqueued ${reconciliationJobs.length} relationships for reconciliation.`);
+            } catch (error) {
+                console.error(`[ValidationWorker] Failed to enqueue ${reconciliationJobs.length} jobs:`, error);
+                
+                // Add retry logic with exponential backoff
+                let lastError = error;
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        console.log(`[ValidationWorker] Retry attempt ${attempt}/3 for ${reconciliationJobs.length} jobs`);
+                        await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+                        await this.reconciliationQueue.addBulk(reconciliationJobs);
+                        console.log(`[ValidationWorker] Retry ${attempt} successful - enqueued ${reconciliationJobs.length} jobs`);
+                        break;
+                    } catch (retryError) {
+                        lastError = retryError;
+                        console.warn(`[ValidationWorker] Retry attempt ${attempt} failed:`, retryError.message);
+                        if (attempt === 3) {
+                            console.error(`[ValidationWorker] All retries failed for ${reconciliationJobs.length} jobs. Final error:`, retryError);
+                            // Re-throw to trigger job retry at the worker level
+                            throw new Error(`Failed to enqueue reconciliation jobs after 3 attempts: ${retryError.message}`);
+                        }
+                    }
+                }
+            }
         }
     }
 }

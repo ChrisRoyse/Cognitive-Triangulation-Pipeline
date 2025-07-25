@@ -1,0 +1,139 @@
+{
+  "id": "demo-session-1753408030119",
+  "startTime": 1753408030119,
+  "initialScore": 87,
+  "targetScore": 100,
+  "currentScore": 95,
+  "iterations": [
+    {
+      "number": 1,
+      "timestamp": 1753408030120,
+      "duration": 74553.62364389945,
+      "qualityScore": 90,
+      "componentScores": {
+        "dataIntegrity": {
+          "score": 20,
+          "issues": [
+            "46200 relationships with confidence but no evidence"
+          ],
+          "details": "Data integrity check completed. 1 issues found."
+        },
+        "performance": {
+          "score": 20,
+          "issues": [],
+          "details": "Performance assessment completed in 6ms. Database size: 35.88MB"
+        },
+        "robustness": {
+          "score": 15,
+          "issues": [
+            "Robustness test failed: no such table: relationship_evidence"
+          ],
+          "details": "Robustness assessment completed. Tested error handling, edge cases, and fault tolerance."
+        },
+        "completeness": {
+          "score": 15,
+          "issues": [],
+          "details": "Completeness assessment finished. 3/3 core files present."
+        },
+        "productionReadiness": {
+          "score": 10,
+          "issues": [
+            "Missing graceful shutdown handling"
+          ],
+          "details": "Production readiness assessment completed. Key infrastructure components evaluated."
+        },
+        "documentation": {
+          "score": 7,
+          "issues": [
+            "Low comment coverage in fix-data-consistency-issues.js",
+            "Low comment coverage in validate-consistency-fixes.js",
+            "Missing troubleshooting documentation"
+          ],
+          "details": "Documentation assessment completed. Evaluated README, API docs, comments, and examples."
+        }
+      },
+      "improvements": [
+        {
+          "component": "dataIntegrity",
+          "improvement": "Fixed orphaned relationships"
+        },
+        {
+          "component": "documentation",
+          "improvement": "Added troubleshooting guide"
+        }
+      ],
+      "tasksCompleted": 2,
+      "tasksFailed": 0,
+      "scoreImprovement": 3
+    },
+    {
+      "number": 2,
+      "timestamp": 1753408030121,
+      "duration": 37040.53369464722,
+      "qualityScore": 95,
+      "componentScores": {
+        "dataIntegrity": {
+          "score": 20,
+          "issues": [
+            "46200 relationships with confidence but no evidence"
+          ],
+          "details": "Data integrity check completed. 1 issues found."
+        },
+        "performance": {
+          "score": 20,
+          "issues": [],
+          "details": "Performance assessment completed in 6ms. Database size: 35.88MB"
+        },
+        "robustness": {
+          "score": 15,
+          "issues": [
+            "Robustness test failed: no such table: relationship_evidence"
+          ],
+          "details": "Robustness assessment completed. Tested error handling, edge cases, and fault tolerance."
+        },
+        "completeness": {
+          "score": 15,
+          "issues": [],
+          "details": "Completeness assessment finished. 3/3 core files present."
+        },
+        "productionReadiness": {
+          "score": 10,
+          "issues": [
+            "Missing graceful shutdown handling"
+          ],
+          "details": "Production readiness assessment completed. Key infrastructure components evaluated."
+        },
+        "documentation": {
+          "score": 7,
+          "issues": [
+            "Low comment coverage in fix-data-consistency-issues.js",
+            "Low comment coverage in validate-consistency-fixes.js",
+            "Missing troubleshooting documentation"
+          ],
+          "details": "Documentation assessment completed. Evaluated README, API docs, comments, and examples."
+        }
+      },
+      "improvements": [
+        {
+          "component": "dataIntegrity",
+          "improvement": "Fixed orphaned relationships"
+        },
+        {
+          "component": "documentation",
+          "improvement": "Added troubleshooting guide"
+        }
+      ],
+      "tasksCompleted": 2,
+      "tasksFailed": 0,
+      "scoreImprovement": 5
+    }
+  ],
+  "status": "ended",
+  "velocity": 8.099235353170771,
+  "plateauDetected": false,
+  "alerts": [],
+  "endTime": 1753408030122,
+  "endReason": "demo_completed",
+  "totalDuration": 3,
+  "totalImprovement": 8
+}

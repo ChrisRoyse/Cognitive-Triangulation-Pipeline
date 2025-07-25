@@ -9,7 +9,16 @@
 //
 
 const neo4j = require('neo4j-driver');
-const { NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE } = require('../config');
+const { 
+  NEO4J_URI, 
+  NEO4J_USER, 
+  NEO4J_PASSWORD, 
+  NEO4J_DATABASE,
+  NEO4J_CONNECTION_TIMEOUT,
+  NEO4J_MAX_TRANSACTION_RETRY_TIME,
+  NEO4J_CONNECTION_POOL_SIZE,
+  NEO4J_CONNECTION_ACQUISITION_TIMEOUT
+} = require('../config');
 
 // This is a placeholder for the actual driver instance.
 // The real implementation would initialize this based on environment variables.
@@ -39,7 +48,19 @@ function getDriver() {
     console.log(`[Neo4jDriver] Connecting to Neo4j at ${NEO4J_URI} (resolved to ${resolvedURI}) with user ${NEO4J_USER} and database ${NEO4J_DATABASE}`);
     driver = neo4j.driver(
       resolvedURI,
-      neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD)
+      neo4j.auth.basic(NEO4J_USER, NEO4J_PASSWORD),
+      {
+        connectionTimeout: NEO4J_CONNECTION_TIMEOUT,
+        maxTransactionRetryTime: NEO4J_MAX_TRANSACTION_RETRY_TIME,
+        connectionPoolSize: NEO4J_CONNECTION_POOL_SIZE,
+        connectionAcquisitionTimeout: NEO4J_CONNECTION_ACQUISITION_TIMEOUT,
+        logging: {
+          level: 'info',
+          logger: (level, message) => {
+            console.log(`[Neo4j ${level}] ${message}`);
+          }
+        }
+      }
     );
   }
   return driver;

@@ -1,47 +1,50 @@
 const { DatabaseManager } = require('./utils/sqliteDb');
 const neo4jDriver = require('./utils/neo4jDriver');
 const { getInstance: getQueueManagerInstance } = require('./utils/queueManager');
-const { getCacheClient, closeCacheClient } = require('./utils/cacheClient');
 const { WorkerPoolManager } = require('./utils/workerPoolManager');
+const { PipelineError } = require('./utils/PipelineError');
+const { ErrorReporter } = require('./utils/ErrorReporter');
+const { ShutdownCoordinator } = require('./utils/shutdownCoordinator');
 const EntityScout = require('./agents/EntityScout');
 const FileAnalysisWorker = require('./workers/fileAnalysisWorker');
 const DirectoryResolutionWorker = require('./workers/directoryResolutionWorker');
 const DirectoryAggregationWorker = require('./workers/directoryAggregationWorker');
 const RelationshipResolutionWorker = require('./workers/relationshipResolutionWorker');
+const GlobalRelationshipAnalysisWorker = require('./workers/GlobalRelationshipAnalysisWorker');
 const ValidationWorker = require('./workers/ValidationWorker');
 const ReconciliationWorker = require('./workers/ReconciliationWorker');
-const GraphBuilderWorker = require('./agents/GraphBuilder');
+const StandardGraphBuilder = require('./agents/StandardGraphBuilder');
 const TransactionalOutboxPublisher = require('./services/TransactionalOutboxPublisher');
+const TriangulatedAnalysisQueue = require('./services/triangulation/TriangulatedAnalysisQueue');
 const config = require('./config');
 const { v4: uuidv4 } = require('uuid');
 const { getDeepseekClient } = require('./utils/deepseekClient');
 const { PipelineConfig } = require('./config/pipelineConfig');
 
 class CognitiveTriangulationPipeline {
-    constructor(targetDirectory, dbPath = './database.db', options = {}) {
+    constructor(targetDirectory, dbPath = null, options = {}) {
         this.targetDirectory = targetDirectory;
-        this.dbPath = dbPath;
+        this.pipelineConfig = options.pipelineConfig || PipelineConfig.createDefault();
+        this.dbPath = dbPath || this.pipelineConfig.database.sqlite.path;
         this.runId = uuidv4();
         this.queueManager = getQueueManagerInstance();
         this.dbManager = new DatabaseManager(this.dbPath);
-        
-        // Use centralized configuration
-        this.pipelineConfig = options.pipelineConfig || PipelineConfig.createDefault();
-        console.log('🔧 Pipeline Configuration:', this.pipelineConfig.getSummary());
-        
-        this.cacheClient = getCacheClient();
         this.llmClient = getDeepseekClient();
         
-        // Initialize WorkerPoolManager using centralized config
+        // Initialize error reporting system
+        this.errorReporter = new ErrorReporter({
+            metricsPath: options.errorMetricsPath || './data/error-metrics.json',
+            reportPath: options.errorReportPath || './data/error-reports'
+        });
         this.workerPoolManager = new WorkerPoolManager({
             environment: this.pipelineConfig.environment,
             maxGlobalConcurrency: this.pipelineConfig.TOTAL_WORKER_CONCURRENCY,
             cpuThreshold: this.pipelineConfig.performance.cpuThreshold,
             memoryThreshold: this.pipelineConfig.performance.memoryThreshold
         });
-        
-        this.outboxPublisher = null; // Will be initialized after database setup
-        this.workers = []; // Track workers for cleanup
+        this.outboxPublisher = null;
+        this.triangulatedAnalysisQueue = null;
+        this.workers = [];
         this.metrics = {
             startTime: null,
             endTime: null,
@@ -52,13 +55,20 @@ class CognitiveTriangulationPipeline {
     async initialize() {
         console.log('🚀 [main.js] Initializing Cognitive Triangulation v2 Pipeline...');
         
-        // Initialize database schema with migrations
         await this.dbManager.initializeDb();
-        console.log('🚀 [main.js] Database schema initialized with migrations.');
+        console.log('✅ [main.js] Database schema initialized.');
         
-        // Initialize outbox publisher after database is ready
         this.outboxPublisher = new TransactionalOutboxPublisher(this.dbManager, this.queueManager);
-        console.log('🚀 [main.js] TransactionalOutboxPublisher initialized.');
+        this.triangulatedAnalysisQueue = new TriangulatedAnalysisQueue(
+            this.dbManager,
+            this.queueManager,
+            {
+                concurrency: this.pipelineConfig.triangulation?.concurrency || 2,
+                confidenceThreshold: this.pipelineConfig.triangulation?.confidenceThreshold || 0.45,
+                enableAutoTrigger: this.pipelineConfig.triangulation?.enableAutoTrigger !== false,
+                processingTimeout: this.pipelineConfig.triangulation?.processingTimeout || 300000
+            }
+        );
         
         await this.queueManager.connect();
         await this.clearDatabases();
@@ -68,15 +78,16 @@ class CognitiveTriangulationPipeline {
     async run() {
         console.log(`🚀 [main.js] Pipeline run started with ID: ${this.runId}`);
         this.metrics.startTime = new Date();
+        
         try {
             await this.initialize();
-
-            console.log('🏁 [main.js] Starting workers and services...');
             await this.startWorkers();
+            
             this.outboxPublisher.start();
+            await this.triangulatedAnalysisQueue.start();
 
             console.log('🔍 [main.js] Starting EntityScout to produce jobs...');
-            const entityScout = new EntityScout(this.queueManager, this.cacheClient, this.targetDirectory, this.runId);
+            const entityScout = new EntityScout(this.queueManager, this.targetDirectory, this.runId, this.dbManager);
             const { totalJobs } = await entityScout.run();
             this.metrics.totalJobs = totalJobs;
             console.log(`✅ [main.js] EntityScout created ${totalJobs} initial jobs.`);
@@ -86,45 +97,55 @@ class CognitiveTriangulationPipeline {
             console.log('🎉 [main.js] All analysis and reconciliation jobs completed!');
             
             console.log('🏗️ [main.js] Starting final graph build...');
-            const graphBuilder = new GraphBuilderWorker(this.dbManager.getDb(), neo4jDriver);
+            const graphBuilder = new StandardGraphBuilder(this.dbManager.getDb(), neo4jDriver, config.NEO4J_DATABASE);
             await graphBuilder.run();
             console.log('✅ [main.js] Graph build complete.');
 
             this.metrics.endTime = new Date();
             await this.printFinalReport();
         } catch (error) {
-            console.error('❌ [main.js] Critical error in pipeline execution:', error);
-            throw error;
+            // Create enhanced error with comprehensive context
+            const pipelineError = await this._createEnhancedError(error, 'PIPELINE_EXECUTION', {
+                stage: 'main_execution',
+                runId: this.runId,
+                targetDirectory: this.targetDirectory,
+                duration: this.metrics.startTime ? Date.now() - this.metrics.startTime : 0,
+                totalJobs: this.metrics.totalJobs
+            });
+            
+            // Report the error through the centralized system
+            await this.errorReporter.reportError(pipelineError);
+            
+            console.error('❌ [main.js] Critical error in pipeline execution:', {
+                ...pipelineError.toLogObject(),
+                actionSuggestions: pipelineError.getActionSuggestions().slice(0, 3)
+            });
+            
+            throw pipelineError;
         } finally {
             await this.close();
         }
     }
 
     async startWorkers() {
-        console.log('🚀 [main.js] Starting managed workers with intelligent concurrency control...');
+        console.log('🚀 [main.js] Starting workers...');
         
         try {
-            // Create and initialize workers with centralized configuration
             const fileAnalysisWorker = new FileAnalysisWorker(
                 this.queueManager, 
                 this.dbManager, 
-                this.cacheClient, 
                 this.llmClient, 
                 this.workerPoolManager,
                 { pipelineConfig: this.pipelineConfig }
             );
-            
-            // Initialize the managed worker if it exists
             if (fileAnalysisWorker.managedWorker) {
                 await fileAnalysisWorker.initializeWorker();
             }
-            
             this.workers.push(fileAnalysisWorker);
             
             const directoryResolutionWorker = new DirectoryResolutionWorker(
                 this.queueManager, 
                 this.dbManager, 
-                this.cacheClient, 
                 this.llmClient, 
                 this.workerPoolManager
             );
@@ -135,7 +156,6 @@ class CognitiveTriangulationPipeline {
             
             const directoryAggregationWorker = new DirectoryAggregationWorker(
                 this.queueManager, 
-                this.cacheClient, 
                 this.workerPoolManager
             );
             if (directoryAggregationWorker.managedWorker) {
@@ -147,17 +167,29 @@ class CognitiveTriangulationPipeline {
                 this.queueManager, 
                 this.dbManager, 
                 this.llmClient, 
-                this.workerPoolManager
+                this.workerPoolManager,
+                { pipelineConfig: this.pipelineConfig }
             );
             if (relationshipResolutionWorker.managedWorker) {
                 await relationshipResolutionWorker.initializeWorker();
             }
             this.workers.push(relationshipResolutionWorker);
             
+            const globalRelationshipAnalysisWorker = new GlobalRelationshipAnalysisWorker(
+                this.queueManager, 
+                this.dbManager, 
+                this.llmClient, 
+                this.workerPoolManager,
+                { pipelineConfig: this.pipelineConfig }
+            );
+            if (globalRelationshipAnalysisWorker.managedWorker) {
+                await globalRelationshipAnalysisWorker.initializeWorker();
+            }
+            this.workers.push(globalRelationshipAnalysisWorker);
+            
             const validationWorker = new ValidationWorker(
                 this.queueManager, 
                 this.dbManager, 
-                this.cacheClient, 
                 this.workerPoolManager
             );
             if (validationWorker.managedWorker) {
@@ -175,35 +207,72 @@ class CognitiveTriangulationPipeline {
             }
             this.workers.push(reconciliationWorker);
             
-            console.log('✅ All managed workers are running and listening for jobs.');
-            
-            // Log worker pool status
-            const status = this.workerPoolManager.getStatus();
-            console.log(`📊 WorkerPoolManager Status: ${Object.keys(status.workers).length} workers registered, max global concurrency: ${status.globalConcurrency.max}`);
+            console.log('✅ All workers are running and listening for jobs.');
             
         } catch (error) {
-            console.error('❌ [main.js] Error starting workers:', error);
-            throw error;
+            // Create enhanced error for worker startup failure
+            const workerError = await this._createEnhancedError(error, 'WORKER_STARTUP', {
+                stage: 'worker_initialization',
+                runId: this.runId,
+                workersCreated: this.workers.length,
+                targetWorkerTypes: [
+                    'FileAnalysisWorker',
+                    'DirectoryResolutionWorker', 
+                    'DirectoryAggregationWorker',
+                    'RelationshipResolutionWorker',
+                    'GlobalRelationshipAnalysisWorker',
+                    'ValidationWorker',
+                    'ReconciliationWorker'
+                ]
+            });
+            
+            // Report the error
+            await this.errorReporter.reportError(workerError);
+            
+            console.error('❌ [main.js] Error starting workers:', {
+                ...workerError.toLogObject(),
+                actionSuggestions: workerError.getActionSuggestions().slice(0, 2)
+            });
+            
+            throw workerError;
         }
     }
 
     async clearDatabases() {
         const db = this.dbManager.getDb();
         console.log('🗑️ Clearing SQLite database...');
-        db.exec('DELETE FROM relationships');
-        db.exec('DELETE FROM relationship_evidence');
-        db.exec('DELETE FROM pois');
-        db.exec('DELETE FROM files');
-        db.exec('DELETE FROM directory_summaries');
+        
+        const tables = [
+            'relationships',
+            'relationship_evidence',
+            'pois',
+            'files',
+            'directory_summaries',
+            'triangulated_analysis_sessions',
+            'triangulated_analysis_results'
+        ];
+        
+        for (const table of tables) {
+            try {
+                db.exec(`DELETE FROM ${table}`);
+            } catch (error) {
+                if (!error.message.includes('no such table')) {
+                    throw error;
+                }
+            }
+        }
 
-        console.log('🗑️ Clearing Redis database...');
-        await this.cacheClient.flushdb();
+        console.log('🗑️ Clearing Redis queues...');
+        await this.queueManager.clearAllQueues();
 
         const driver = neo4jDriver;
         console.log('🗑️ Clearing Neo4j database...');
         const session = driver.session({ database: config.NEO4J_DATABASE });
+        
         try {
-            await session.run('MATCH (n) DETACH DELETE n');
+            await session.writeTransaction(async (tx) => {
+                await tx.run('MATCH (n) DETACH DELETE n');
+            });
             console.log('✅ Neo4j database cleared successfully');
         } catch (error) {
             console.error('❌ Error clearing Neo4j database:', error);
@@ -226,37 +295,65 @@ class CognitiveTriangulationPipeline {
 
     async waitForCompletion() {
         return new Promise((resolve, reject) => {
-            const checkInterval = 5000; // Check every 5 seconds
-            const maxWaitTime = 10 * 60 * 1000; // 10 minutes maximum wait time
-            const maxFailureRate = 0.5; // Allow up to 50% job failure rate
+            const checkInterval = this.pipelineConfig.monitoring.checkIntervalMs;
+            const maxWaitTime = this.pipelineConfig.monitoring.maxWaitTimeMs;
+            const maxFailureRate = this.pipelineConfig.monitoring.maxFailureRate;
             const startTime = Date.now();
             let idleChecks = 0;
-            const requiredIdleChecks = 3; // Require 3 consecutive idle checks to be sure
+            const requiredIdleChecks = this.pipelineConfig.monitoring.requiredIdleChecks;
 
             const intervalId = setInterval(async () => {
                 try {
                     const counts = await this.queueManager.getJobCounts();
-                    const totalActive = counts.active + counts.waiting + counts.delayed;
+                    const triangulatedCounts = await this.triangulatedAnalysisQueue.queue?.getJobCounts() || {};
+                    const totalTriangulatedActive = (triangulatedCounts.active || 0) + (triangulatedCounts.waiting || 0);
+                    
+                    const totalActive = counts.active + counts.waiting + counts.delayed + totalTriangulatedActive;
                     const totalProcessed = counts.completed + counts.failed;
                     const failureRate = totalProcessed > 0 ? counts.failed / totalProcessed : 0;
                     
-                    console.log(`[Queue Monitor] Active: ${counts.active}, Waiting: ${counts.waiting}, Completed: ${counts.completed}, Failed: ${counts.failed}, Failure Rate: ${(failureRate * 100).toFixed(1)}%`);
+                    console.log(`[Queue Monitor] Active: ${counts.active}, Waiting: ${counts.waiting}, Completed: ${counts.completed}, Failed: ${counts.failed}`);
 
                     // Check for timeout
                     if (Date.now() - startTime > maxWaitTime) {
-                        console.error('❌ [Queue Monitor] Maximum wait time exceeded. Forcing completion.');
-                        console.error(`Final stats - Completed: ${counts.completed}, Failed: ${counts.failed}, Still Active: ${totalActive}`);
                         clearInterval(intervalId);
-                        resolve(); // Force completion rather than reject to allow GraphBuilder to run
+                        const timeoutError = PipelineError.timeout('pipeline-completion', maxWaitTime, {
+                            runId: this.runId,
+                            stage: 'completion_monitoring',
+                            activeJobs: totalActive,
+                            completed: counts.completed,
+                            failed: counts.failed,
+                            triangulatedActive: totalTriangulatedActive,
+                            elapsedTime: Date.now() - startTime
+                        });
+                        
+                        // Report timeout error
+                        await this.errorReporter.reportError(timeoutError);
+                        reject(timeoutError);
                         return;
                     }
 
                     // Check for excessive failure rate
                     if (totalProcessed > 10 && failureRate > maxFailureRate) {
-                        console.error(`❌ [Queue Monitor] Excessive failure rate (${(failureRate * 100).toFixed(1)}%). Forcing completion.`);
-                        console.error(`Final stats - Completed: ${counts.completed}, Failed: ${counts.failed}, Still Active: ${totalActive}`);
                         clearInterval(intervalId);
-                        resolve(); // Force completion to allow partial results processing
+                        const failureError = new PipelineError({
+                            type: 'EXCESSIVE_FAILURES',
+                            message: `Pipeline failure rate too high: ${(failureRate * 100).toFixed(1)}% (threshold: ${(maxFailureRate * 100).toFixed(1)}%)`,
+                            context: {
+                                runId: this.runId,
+                                stage: 'completion_monitoring',
+                                failureRate,
+                                threshold: maxFailureRate,
+                                completed: counts.completed,
+                                failed: counts.failed,
+                                totalProcessed,
+                                triangulatedCounts
+                            }
+                        });
+                        
+                        // Report failure rate error
+                        await this.errorReporter.reportError(failureError);
+                        reject(failureError);
                         return;
                     }
 
@@ -264,15 +361,13 @@ class CognitiveTriangulationPipeline {
                         idleChecks++;
                         console.log(`[Queue Monitor] Queues appear idle. Check ${idleChecks}/${requiredIdleChecks}.`);
                         if (idleChecks >= requiredIdleChecks) {
-                            console.log(`✅ [Queue Monitor] Pipeline completion - Completed: ${counts.completed}, Failed: ${counts.failed}`);
                             clearInterval(intervalId);
                             resolve();
                         }
                     } else {
-                        idleChecks = 0; // Reset if we see activity
+                        idleChecks = 0;
                     }
                 } catch (error) {
-                    console.error('[Queue Monitor] Error checking job counts:', error);
                     clearInterval(intervalId);
                     reject(error);
                 }
@@ -281,44 +376,77 @@ class CognitiveTriangulationPipeline {
     }
 
     async close() {
-        console.log('🚀 [main.js] Closing connections...');
+        console.log('🚀 [main.js] Initiating shutdown...');
         
         try {
             // Stop outbox publisher
-            this.outboxPublisher.stop();
+            if (this.outboxPublisher) {
+                await Promise.race([
+                    this.outboxPublisher.stop(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('OutboxPublisher stop timeout')), this.pipelineConfig.monitoring.shutdownTimeouts.outboxPublisher))
+                ]);
+                console.log('✅ [main.js] OutboxPublisher stopped.');
+            }
             
-            // Gracefully shutdown all workers
+            // Stop triangulated analysis queue
+            if (this.triangulatedAnalysisQueue) {
+                await Promise.race([
+                    this.triangulatedAnalysisQueue.stop(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('TriangulatedAnalysisQueue stop timeout')), 10000))
+                ]);
+                console.log('✅ [main.js] TriangulatedAnalysisQueue stopped.');
+            }
+            
+            // Shutdown workers
             console.log('🛑 [main.js] Shutting down workers...');
-            const workerShutdowns = this.workers.map(async (worker) => {
+            for (const worker of this.workers) {
                 if (worker && typeof worker.close === 'function') {
                     try {
-                        await worker.close();
+                        await Promise.race([
+                            worker.close(),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error(`Worker ${worker.constructor.name} close timeout`)), 15000))
+                        ]);
+                        console.log(`✅ [main.js] Worker ${worker.constructor.name} closed successfully.`);
                     } catch (error) {
-                        console.error('❌ Error closing worker:', error);
+                        console.error(`❌ Error closing worker ${worker.constructor.name}:`, error.message);
                     }
                 }
-            });
-            await Promise.all(workerShutdowns);
+            }
             
             // Shutdown WorkerPoolManager
             if (this.workerPoolManager) {
-                await this.workerPoolManager.shutdown();
+                await Promise.race([
+                    this.workerPoolManager.shutdown(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('WorkerPoolManager shutdown timeout')), 20000))
+                ]);
+                console.log('✅ [main.js] WorkerPoolManager shutdown successfully.');
             }
             
-            // Close other connections
-            await this.queueManager.closeConnections();
-            await closeCacheClient();
+            // Close queue connections
+            await Promise.race([
+                this.queueManager.closeConnections(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('QueueManager close timeout')), 10000))
+            ]);
+            console.log('✅ [main.js] Queue connections closed successfully.');
             
+            // Close Neo4j driver
             const driver = neo4jDriver;
             if (process.env.NODE_ENV !== 'test' && driver) {
-                await driver.close();
+                await Promise.race([
+                    driver.close(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Neo4j driver close timeout')), 10000))
+                ]);
+                console.log('✅ [main.js] Neo4j driver closed successfully.');
             }
             
+            // Close SQLite database
             this.dbManager.close();
+            console.log('✅ [main.js] SQLite database closed successfully.');
+            
             console.log('✅ [main.js] All connections closed gracefully.');
             
         } catch (error) {
-            console.error('❌ [main.js] Error during cleanup:', error);
+            console.error('❌ [main.js] Error during cleanup:', error.message);
             throw error;
         }
     }
@@ -326,7 +454,9 @@ class CognitiveTriangulationPipeline {
 
 async function main() {
     const args = process.argv.slice(2);
-    const targetDirectory = args.includes('--target') ? args[args.indexOf('--target') + 1] : process.cwd();
+    const targetDirectory = args.includes('--target') 
+        ? args[args.indexOf('--target') + 1] 
+        : (args[0] && !args[0].startsWith('--') ? args[0] : process.cwd());
     const isTestMode = args.includes('--test-mode');
     let pipeline;
 
@@ -335,7 +465,6 @@ async function main() {
         await pipeline.run();
         console.log('🎉 Cognitive triangulation pipeline completed successfully!');
         if (isTestMode) {
-            // In test mode, we exit cleanly for the test runner.
             process.exit(0);
         }
     } catch (error) {

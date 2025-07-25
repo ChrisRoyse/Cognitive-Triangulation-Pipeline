@@ -68,7 +68,7 @@ describe('Granular E2E Database Validation - Production Style', () => {
             { cid: 1, name: 'source_poi_id', type: 'INTEGER', notnull: 0, dflt_value: null, pk: 0 },
             { cid: 2, name: 'target_poi_id', type: 'INTEGER', notnull: 0, dflt_value: null, pk: 0 },
             { cid: 3, name: 'type', type: 'TEXT', notnull: 1, dflt_value: null, pk: 0 },
-            { cid: 5, name: 'confidence_score', type: 'REAL', notnull: 0, dflt_value: null, pk: 0 },
+            { cid: 5, name: 'confidence', type: 'REAL', notnull: 0, dflt_value: null, pk: 0 },
         ]));
         
         const fks = getForeignKeys(db, 'relationships');
@@ -80,7 +80,7 @@ describe('Granular E2E Database Validation - Production Style', () => {
 
     test('E2E-DB-VALID-03: Validates the semantic correctness of persisted `relationships` data', () => {
         const callRelationship = db.prepare(`
-            SELECT p1.type as source_type, p2.type as target_type, r.confidence_score
+            SELECT p1.type as source_type, p2.type as target_type, r.confidence
             FROM relationships r
             JOIN pois p1 ON r.source_poi_id = p1.id
             JOIN pois p2 ON r.target_poi_id = p2.id
@@ -89,8 +89,8 @@ describe('Granular E2E Database Validation - Production Style', () => {
 
         expect(callRelationship.source_type).toBe('Function');
         expect(callRelationship.target_type).toBe('Function');
-        expect(callRelationship.confidence_score).toBeGreaterThan(0.5);
-        expect(callRelationship.confidence_score).toBeLessThanOrEqual(1);
+        expect(callRelationship.confidence).toBeGreaterThan(0.5);
+        expect(callRelationship.confidence).toBeLessThanOrEqual(1);
     });
     
     test('E2E-DB-VALID-04: Validates the schema and constraints of the `relationship_evidence` table', () => {

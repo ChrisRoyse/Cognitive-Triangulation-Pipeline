@@ -1,0 +1,103 @@
+{
+  "timestamp": "2025-07-25T01:51:51.902Z",
+  "baseline": {
+    "100_records": {
+      "validation_time_ms": 74.4926,
+      "memory_delta_mb": 0.00284576416015625,
+      "is_valid": true,
+      "errors_count": 0
+    },
+    "500_records": {
+      "validation_time_ms": 73.1898,
+      "memory_delta_mb": 0.00092315673828125,
+      "is_valid": true,
+      "errors_count": 0
+    },
+    "1000_records": {
+      "validation_time_ms": 99.159,
+      "memory_delta_mb": 0.00092315673828125,
+      "is_valid": true,
+      "errors_count": 0
+    },
+    "5000_records": {
+      "validation_time_ms": 168.9623,
+      "memory_delta_mb": 0.00092315673828125,
+      "is_valid": true,
+      "errors_count": 0
+    }
+  },
+  "optimized": {
+    "100_records": {
+      "validation_time_ms": 101.6383,
+      "memory_delta_mb": 0.00092315673828125,
+      "is_valid": true,
+      "errors_count": 0,
+      "cache_hit_rate": "0.00%",
+      "records_processed": 106000
+    },
+    "500_records": {
+      "validation_time_ms": 0.2442,
+      "memory_delta_mb": 0.00101470947265625,
+      "is_valid": true,
+      "errors_count": 0,
+      "cache_hit_rate": "50.00%",
+      "records_processed": 106000
+    },
+    "1000_records": {
+      "validation_time_ms": 0.142,
+      "memory_delta_mb": 0.00093841552734375,
+      "is_valid": true,
+      "errors_count": 0,
+      "cache_hit_rate": "66.67%",
+      "records_processed": 106000
+    },
+    "5000_records": {
+      "validation_time_ms": 0.1955,
+      "memory_delta_mb": 0.00093841552734375,
+      "is_valid": true,
+      "errors_count": 0,
+      "cache_hit_rate": "75.00%",
+      "records_processed": 106000
+    }
+  },
+  "improvements": {
+    "100_records": {
+      "validation_time_improvement_percent": "-36.4",
+      "memory_improvement_percent": "67.6",
+      "baseline_time_ms": "74.49",
+      "optimized_time_ms": "101.64",
+      "cache_hit_rate": "0.00%",
+      "meets_target": false
+    },
+    "500_records": {
+      "validation_time_improvement_percent": "99.7",
+      "memory_improvement_percent": "-9.9",
+      "baseline_time_ms": "73.19",
+      "optimized_time_ms": "0.24",
+      "cache_hit_rate": "50.00%",
+      "meets_target": true
+    },
+    "1000_records": {
+      "validation_time_improvement_percent": "99.9",
+      "memory_improvement_percent": "-1.7",
+      "baseline_time_ms": "99.16",
+      "optimized_time_ms": "0.14",
+      "cache_hit_rate": "66.67%",
+      "meets_target": true
+    },
+    "5000_records": {
+      "validation_time_improvement_percent": "99.9",
+      "memory_improvement_percent": "-1.7",
+      "baseline_time_ms": "168.96",
+      "optimized_time_ms": "0.20",
+      "cache_hit_rate": "75.00%",
+      "meets_target": true
+    }
+  },
+  "test_datasets": [
+    100,
+    500,
+    1000,
+    5000
+  ]
+}

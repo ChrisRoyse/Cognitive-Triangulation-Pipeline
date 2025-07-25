@@ -74,7 +74,7 @@ class RelationshipResolver {
             SELECT p.*, f.file_path
             FROM pois p
             JOIN files f ON p.file_id = f.id
-            ORDER BY f.file_path, p.line_number
+            ORDER BY f.file_path, p.start_line
         `).all();
         
         // Group POIs by file
@@ -100,10 +100,10 @@ class RelationshipResolver {
             // Classes CONTAIN methods (methods that appear after class definition)
             for (const cls of classes) {
                 for (const method of methods) {
-                    if (method.line_number > cls.line_number) {
+                    if (method.start_line > cls.start_line) {
                         // Find the next class after this method to determine containment
-                        const nextClass = classes.find(c => c.line_number > method.line_number);
-                        if (!nextClass || nextClass.line_number > method.line_number) {
+                        const nextClass = classes.find(c => c.start_line > method.start_line);
+                        if (!nextClass || nextClass.start_line > method.start_line) {
                             relationships.push({
                                 source_poi_id: cls.id,
                                 target_poi_id: method.id,
@@ -119,7 +119,7 @@ class RelationshipResolver {
             for (const method of methods) {
                 for (const variable of variables) {
                     // If variable is defined before method and has similar context
-                    if (variable.line_number < method.line_number) {
+                    if (variable.start_line < method.start_line) {
                         relationships.push({
                             source_poi_id: method.id,
                             target_poi_id: variable.id,
@@ -340,12 +340,72 @@ class RelationshipResolver {
     }
 
     persistRelationships(relationships) {
-        const insert = this.db.prepare('INSERT INTO relationships (id, source_poi_id, target_poi_id, type, reason) VALUES (?, ?, ?, ?, ?)');
+        const insert = this.db.prepare('INSERT INTO relationships (id, source_poi_id, target_poi_id, type, confidence, reason, status) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        
+        const validatedRelationships = [];
+        
+        for (const rel of relationships) {
+            try {
+                // Validate required fields
+                if (!rel.source_poi_id || !rel.target_poi_id) {
+                    console.warn(`[RelationshipResolver] Invalid relationship missing POI IDs, skipping:`, rel);
+                    continue;
+                }
+                
+                if (!rel.type || typeof rel.type !== 'string') {
+                    console.warn(`[RelationshipResolver] Invalid relationship missing type, skipping:`, rel);
+                    continue;
+                }
+
+                // Validate and provide defaults for new required fields
+                let confidence = rel.confidence;
+                if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) {
+                    confidence = 0.8; // Default confidence
+                    if (rel.confidence !== undefined) {
+                        console.warn(`[RelationshipResolver] Invalid confidence ${rel.confidence} for relationship ${rel.source_poi_id} -> ${rel.target_poi_id}, using default 0.8`);
+                    }
+                }
+
+                let reason = rel.reason;
+                if (!reason || typeof reason !== 'string') {
+                    reason = `${rel.type} relationship detected`; // Default reason
+                    console.warn(`[RelationshipResolver] Missing reason for relationship ${rel.source_poi_id} -> ${rel.target_poi_id}, using default`);
+                }
+
+                validatedRelationships.push({
+                    id: uuidv4(),
+                    source_poi_id: rel.source_poi_id,
+                    target_poi_id: rel.target_poi_id,
+                    type: rel.type.toUpperCase(),
+                    confidence: confidence,
+                    reason: reason.trim(),
+                    status: 'PENDING'
+                });
+            } catch (error) {
+                console.error(`[RelationshipResolver] Error validating relationship:`, error, rel);
+            }
+        }
+
+        if (validatedRelationships.length === 0) {
+            console.warn(`[RelationshipResolver] No valid relationships to persist`);
+            return;
+        }
+
         this.db.transaction((rels) => {
             for (const rel of rels) {
-                insert.run(uuidv4(), rel.source_poi_id, rel.target_poi_id, rel.type, rel.reason);
+                insert.run(
+                    rel.id,
+                    rel.source_poi_id, 
+                    rel.target_poi_id, 
+                    rel.type, 
+                    rel.confidence,
+                    rel.reason,
+                    rel.status
+                );
             }
-        })(relationships);
+        })(validatedRelationships);
+
+        console.log(`[RelationshipResolver] Persisted ${validatedRelationships.length} validated relationships`);
     }
 }
 

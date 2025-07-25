@@ -72,17 +72,17 @@ class BatchedDatabaseWriter extends EventEmitter {
                 
                 // POI operations
                 insertPoi: this.db.prepare(`
-                    INSERT OR IGNORE INTO pois (file_path, name, type, start_line, end_line, llm_output, hash, run_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported, semantic_id, llm_output, hash, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `),
                 
                 // Relationship operations
                 insertRelationship: this.db.prepare(`
-                    INSERT OR IGNORE INTO relationships (source_poi_id, target_poi_id, type, file_path, status, confidence_score)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO relationships (source_poi_id, target_poi_id, type, file_path, status, confidence, reason, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 `),
                 updateRelationship: this.db.prepare(`
-                    UPDATE relationships SET status = ?, confidence_score = ? WHERE id = ?
+                    UPDATE relationships SET status = ?, confidence = ?, reason = ? WHERE id = ?
                 `),
                 
                 // Directory operations
@@ -98,8 +98,16 @@ class BatchedDatabaseWriter extends EventEmitter {
                 `)
             };
         } catch (error) {
-            console.error('[BatchedDatabaseWriter] Failed to prepare statements:', error);
-            throw error;
+            const errorMsg = '[BatchedDatabaseWriter] Failed to prepare database statements';
+            console.error(errorMsg, {
+                error: error.message,
+                errorType: error.name,
+                errorCode: error.code,
+                action: 'Check database schema matches expected table structure. Verify all required tables exist.',
+                requiredTables: ['outbox', 'pois', 'relationships', 'directory_summaries', 'relationship_evidence'],
+                stack: error.stack
+            });
+            throw new Error(`${errorMsg}: ${error.message}`);
         }
     }
     
@@ -108,7 +116,7 @@ class BatchedDatabaseWriter extends EventEmitter {
      */
     addOutboxUpdate(id, status) {
         if (this.isShuttingDown) {
-            throw new Error('BatchedDatabaseWriter is shutting down');
+            throw new Error('[BatchedDatabaseWriter] Cannot add outbox update - writer is shutting down. Ensure proper shutdown sequence.');
         }
         
         this.batches.outboxUpdates.push({ id, status });
@@ -120,7 +128,7 @@ class BatchedDatabaseWriter extends EventEmitter {
      */
     addOutboxUpdatesBatch(updates) {
         if (this.isShuttingDown) {
-            throw new Error('BatchedDatabaseWriter is shutting down');
+            throw new Error(`[BatchedDatabaseWriter] Cannot add ${updates.length} outbox updates - writer is shutting down. Ensure proper shutdown sequence.`);
         }
         
         this.batches.outboxUpdates.push(...updates);
@@ -132,7 +140,7 @@ class BatchedDatabaseWriter extends EventEmitter {
      */
     addPoiInsert(poi) {
         if (this.isShuttingDown) {
-            throw new Error('BatchedDatabaseWriter is shutting down');
+            throw new Error(`[BatchedDatabaseWriter] Cannot add POI insert for '${poi.name || 'unknown'}' - writer is shutting down. File: ${poi.filePath}`);
         }
         
         this.batches.poiInserts.push(poi);
@@ -144,11 +152,68 @@ class BatchedDatabaseWriter extends EventEmitter {
      */
     addRelationshipInsert(relationship) {
         if (this.isShuttingDown) {
-            throw new Error('BatchedDatabaseWriter is shutting down');
+            throw new Error(`[BatchedDatabaseWriter] Cannot add relationship insert (${relationship.sourcePoiId || '?'} -> ${relationship.targetPoiId || '?'}) - writer is shutting down.`);
         }
         
-        this.batches.relationshipInserts.push(relationship);
-        this._checkAndFlush('relationshipInserts');
+        // Validate relationship before adding to batch
+        try {
+            if (!relationship.sourcePoiId || !relationship.targetPoiId) {
+                console.error('[BatchedDatabaseWriter] Invalid relationship - missing POI IDs:', {
+                    sourcePoiId: relationship.sourcePoiId || 'missing',
+                    targetPoiId: relationship.targetPoiId || 'missing',
+                    type: relationship.type,
+                    filePath: relationship.filePath,
+                    action: 'Ensure POIs are resolved to database IDs before creating relationships',
+                    relationship: JSON.stringify(relationship).substring(0, 200)
+                });
+                return;
+            }
+            
+            if (!relationship.type || typeof relationship.type !== 'string') {
+                console.error('[BatchedDatabaseWriter] Invalid relationship - missing or invalid type:', {
+                    sourcePoiId: relationship.sourcePoiId,
+                    targetPoiId: relationship.targetPoiId,
+                    providedType: relationship.type,
+                    typeType: typeof relationship.type,
+                    validTypes: 'CALLS, USES, IMPORTS, EXTENDS, IMPLEMENTS, etc.',
+                    action: 'Ensure relationship type is a non-empty string',
+                    relationship: JSON.stringify(relationship).substring(0, 200)
+                });
+                return;
+            }
+
+            // Validate and provide defaults for new required fields
+            let confidence = relationship.confidence;
+            if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) {
+                confidence = 0.8; // Default confidence
+                if (relationship.confidence !== undefined) {
+                    console.warn(`[BatchedDatabaseWriter] Invalid confidence ${relationship.confidence} for relationship ${relationship.sourcePoiId} -> ${relationship.targetPoiId}, using default 0.8`);
+                }
+            }
+
+            let reason = relationship.reason;
+            if (!reason || typeof reason !== 'string') {
+                reason = `${relationship.type} relationship detected`; // Default reason
+                if (relationship.reason !== undefined) {
+                    console.warn(`[BatchedDatabaseWriter] Invalid reason for relationship ${relationship.sourcePoiId} -> ${relationship.targetPoiId}, using default`);
+                }
+            }
+
+            // Create validated relationship object
+            const validatedRelationship = {
+                ...relationship,
+                type: relationship.type.toUpperCase(),
+                confidence: confidence,
+                reason: reason.trim(),
+                status: relationship.status || 'PENDING',
+                filePath: relationship.filePath || ''
+            };
+
+            this.batches.relationshipInserts.push(validatedRelationship);
+            this._checkAndFlush('relationshipInserts');
+        } catch (error) {
+            console.error('[BatchedDatabaseWriter] Error validating relationship:', error, relationship);
+        }
     }
     
     /**
@@ -171,7 +236,17 @@ class BatchedDatabaseWriter extends EventEmitter {
             throw new Error('BatchedDatabaseWriter is shutting down');
         }
         
-        this.batches.directoryInserts.push({ runId, directoryPath, summaryText });
+        // Validate required parameters
+        if (!runId || !directoryPath) {
+            console.error('[BatchedDatabaseWriter] addDirectoryInsert called with missing parameters:', {
+                runId: runId || 'undefined',
+                directoryPath: directoryPath || 'undefined',
+                summaryText: summaryText ? 'present' : 'undefined'
+            });
+            throw new Error(`Missing required parameters: runId=${runId}, directoryPath=${directoryPath}`);
+        }
+        
+        this.batches.directoryInserts.push({ runId, directoryPath, summaryText: summaryText || '' });
         this._checkAndFlush('directoryInserts');
     }
     
@@ -284,8 +359,24 @@ class BatchedDatabaseWriter extends EventEmitter {
             
         } catch (error) {
             this.stats.totalErrors++;
-            console.error('[BatchedDatabaseWriter] Batch processing failed:', error);
-            this.emit('batchError', { error, batchTypes, totalItems });
+            const errorContext = {
+                error: error.message,
+                errorType: error.name,
+                errorCode: error.code,
+                batchTypes,
+                totalItems,
+                processingTimeMs: Date.now() - startTime,
+                action: this._getErrorActionSuggestion(error),
+                dbPath: this.dbManager.dbPath,
+                isTransactionError: error.message?.includes('transaction'),
+                stack: error.stack
+            };
+            
+            console.error('[BatchedDatabaseWriter] Batch processing failed:', errorContext);
+            this.emit('batchError', errorContext);
+            
+            // Add context to thrown error
+            error.batchContext = errorContext;
             throw error;
         }
     }
@@ -304,8 +395,8 @@ class BatchedDatabaseWriter extends EventEmitter {
             case 'poiInserts':
                 for (const poi of items) {
                     this.statements.insertPoi.run(
-                        poi.filePath, poi.name, poi.type, poi.startLine, 
-                        poi.endLine, poi.llmOutput, poi.hash, poi.runId
+                        poi.fileId, poi.filePath, poi.name, poi.type, poi.startLine, 
+                        poi.endLine, poi.description, poi.isExported ? 1 : 0, poi.semanticId, poi.llmOutput, poi.hash, poi.runId
                     );
                 }
                 break;
@@ -314,20 +405,36 @@ class BatchedDatabaseWriter extends EventEmitter {
                 for (const rel of items) {
                     this.statements.insertRelationship.run(
                         rel.sourcePoiId, rel.targetPoiId, rel.type, 
-                        rel.filePath, rel.status, rel.confidenceScore
+                        rel.filePath, rel.status, rel.confidence, rel.reason, rel.runId
                     );
                 }
                 break;
                 
             case 'relationshipUpdates':
-                for (const { id, status, confidenceScore } of items) {
-                    this.statements.updateRelationship.run(status, confidenceScore, id);
+                for (const { id, status, confidence, reason } of items) {
+                    this.statements.updateRelationship.run(status, confidence, reason, id);
                 }
                 break;
                 
             case 'directoryInserts':
-                for (const { runId, directoryPath, summaryText } of items) {
-                    this.statements.insertDirectorySummary.run(runId, directoryPath, summaryText);
+                for (const item of items) {
+                    const { runId, directoryPath, summaryText } = item;
+                    
+                    // Validate required parameters
+                    if (!runId || !directoryPath) {
+                        console.error('[BatchedDatabaseWriter] Missing required parameters for directory insert:', {
+                            runId: runId || 'undefined',
+                            directoryPath: directoryPath || 'undefined',
+                            summaryText: summaryText ? 'present' : 'undefined',
+                            item
+                        });
+                        continue; // Skip this item
+                    }
+                    
+                    // Use empty string as default for summaryText if not provided
+                    const summary = summaryText || '';
+                    
+                    this.statements.insertDirectorySummary.run(runId, directoryPath, summary);
                 }
                 break;
                 
@@ -418,6 +525,34 @@ class BatchedDatabaseWriter extends EventEmitter {
     }
     
     /**
+     * Get error action suggestion based on error type
+     */
+    _getErrorActionSuggestion(error) {
+        if (error.code === 'SQLITE_BUSY' || error.message?.includes('database is locked')) {
+            return 'Database is locked. Check for long-running transactions or concurrent write operations. Consider increasing busy timeout.';
+        }
+        if (error.code === 'SQLITE_CONSTRAINT' || error.message?.includes('constraint')) {
+            return 'Database constraint violation. Check unique constraints, foreign keys, and data validity.';
+        }
+        if (error.code === 'SQLITE_CORRUPT' || error.message?.includes('corrupt')) {
+            return 'Database corruption detected. Run integrity check and consider restoring from backup.';
+        }
+        if (error.code === 'SQLITE_FULL' || error.message?.includes('disk full')) {
+            return 'Disk full error. Check available disk space and clean up if necessary.';
+        }
+        if (error.message?.includes('no such table')) {
+            return 'Missing database table. Run database initialization or migrations.';
+        }
+        if (error.message?.includes('no such column')) {
+            return 'Missing database column. Check schema version and run pending migrations.';
+        }
+        if (error.message?.includes('transaction')) {
+            return 'Transaction error. Check for nested transactions or transaction state issues.';
+        }
+        return 'Review error details and database logs. Ensure database schema is up to date.';
+    }
+    
+    /**
      * WAL mode optimization - checkpoint the WAL file
      */
     checkpointWAL() {
@@ -426,7 +561,13 @@ class BatchedDatabaseWriter extends EventEmitter {
             console.log('[BatchedDatabaseWriter] WAL checkpoint completed:', result);
             return result;
         } catch (error) {
-            console.error('[BatchedDatabaseWriter] WAL checkpoint failed:', error);
+            console.error('[BatchedDatabaseWriter] WAL checkpoint failed:', {
+                error: error.message,
+                errorCode: error.code,
+                action: 'Check database is not in exclusive lock mode. Ensure no active write transactions.',
+                suggestion: 'Try again after current transactions complete',
+                stack: error.stack
+            });
             throw error;
         }
     }
@@ -446,7 +587,12 @@ class BatchedDatabaseWriter extends EventEmitter {
                 walInfo
             };
         } catch (error) {
-            console.error('[BatchedDatabaseWriter] Failed to get WAL stats:', error);
+            console.error('[BatchedDatabaseWriter] Failed to get WAL stats:', {
+                error: error.message,
+                errorCode: error.code,
+                action: 'Non-critical error. WAL stats unavailable but processing can continue.',
+                stack: error.stack
+            });
             return null;
         }
     }

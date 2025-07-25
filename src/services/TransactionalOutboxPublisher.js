@@ -1,6 +1,9 @@
 const { DatabaseManager } = require('../utils/sqliteDb');
 const QueueManager = require('../utils/queueManager');
 const BatchedDatabaseWriter = require('../utils/batchedDatabaseWriter');
+const TriangulatedAnalysisQueue = require('./triangulation/TriangulatedAnalysisQueue');
+const ConfidenceScorer = require('./ConfidenceScorer');
+const { getModeConfig, shouldUseParallelMode } = require('../config/triangulationConfig');
 const crypto = require('crypto');
 
 class TransactionalOutboxPublisher {
@@ -19,6 +22,38 @@ class TransactionalOutboxPublisher {
             enableStats: batchOptions.enableStats !== false
         });
         
+        // Initialize triangulated analysis system with configuration options
+        this.confidenceScorer = new ConfidenceScorer(batchOptions.confidenceOptions || {});
+        
+        // Get triangulation configuration
+        const useParallel = shouldUseParallelMode();
+        const modeConfig = getModeConfig(useParallel ? 'parallel' : 'sequential');
+        
+        this.triangulatedAnalysisQueue = new TriangulatedAnalysisQueue(
+            dbManager, 
+            queueManager, 
+            null, // No cache client - using database instead
+            {
+                ...batchOptions.triangulationOptions,
+                coordinationMode: modeConfig.mode,
+                enableAdvancedOrchestration: modeConfig.mode === 'parallel',
+                maxParallelAgents: modeConfig.maxParallelAgents,
+                concurrency: modeConfig.queueSettings.concurrency,
+                confidenceThreshold: modeConfig.confidenceScoring.triangulationTriggerThreshold,
+                orchestratorOptions: modeConfig.mode === 'parallel' ? {
+                    enableParallelCoordination: true,
+                    enableAdvancedConsensus: modeConfig.enableAdvancedConsensus,
+                    enableRealTimeMonitoring: modeConfig.enableRealTimeMonitoring,
+                    maxConcurrentSessions: modeConfig.maxConcurrentSessions,
+                    sessionTimeout: modeConfig.sessionTimeout,
+                    adaptiveOptimization: modeConfig.adaptiveOptimization,
+                    cacheResults: modeConfig.enableCaching
+                } : {}
+            }
+        );
+        
+        console.log(`[TransactionalOutboxPublisher] Triangulation configured: Mode=${modeConfig.mode}, Agents=${modeConfig.maxParallelAgents || 3}`);
+        
         // Set up event listeners for monitoring
         this.batchWriter.on('batchProcessed', (info) => {
             console.log(`[TransactionalOutboxPublisher] Batch processed: ${info.totalItems} items in ${info.processingTimeMs}ms`);
@@ -29,11 +64,15 @@ class TransactionalOutboxPublisher {
         });
     }
 
-    start() {
+    async start() {
         console.log('🚀 [TransactionalOutboxPublisher] Starting publisher...');
         if (this.intervalId) {
             clearInterval(this.intervalId);
         }
+        
+        // Start triangulated analysis queue
+        await this.triangulatedAnalysisQueue.start();
+        
         this.intervalId = setInterval(() => this.pollAndPublish(), this.pollingInterval);
     }
 
@@ -47,6 +86,9 @@ class TransactionalOutboxPublisher {
         while (this.isPolling) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
+        
+        // Stop triangulated analysis queue
+        await this.triangulatedAnalysisQueue.stop();
         
         // Gracefully shut down the batch writer
         await this.batchWriter.shutdown();
@@ -72,11 +114,13 @@ class TransactionalOutboxPublisher {
         const relationshipEvents = events.filter(e => e.event_type === 'relationship-analysis-finding');
         const globalRelationshipEvents = events.filter(e => e.event_type === 'global-relationship-analysis-finding');
         const directoryEvents = events.filter(e => e.event_type === 'directory-analysis-finding');
+        const confidenceEscalationEvents = events.filter(e => e.event_type === 'relationship-confidence-escalation');
         const otherEvents = events.filter(e => 
             e.event_type !== 'file-analysis-finding' && 
             e.event_type !== 'relationship-analysis-finding' &&
             e.event_type !== 'global-relationship-analysis-finding' &&
-            e.event_type !== 'directory-analysis-finding'
+            e.event_type !== 'directory-analysis-finding' &&
+            e.event_type !== 'relationship-confidence-escalation'
         );
 
         // Process POI events FIRST to populate the database
@@ -87,7 +131,15 @@ class TransactionalOutboxPublisher {
                 await this._handleFileAnalysisFinding(event);
                 statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
             } catch (error) {
-                console.error(`[TransactionalOutboxPublisher] Failed to publish POI event ${event.id}:`, error);
+                console.error(`[TransactionalOutboxPublisher] Failed to publish POI event:`, {
+                    eventId: event.id,
+                    eventType: event.event_type,
+                    error: error.message,
+                    errorType: error.name,
+                    payload: event.payload ? JSON.parse(event.payload).filePath : 'unknown',
+                    action: 'Check database connectivity and POI data validity. Review logs for specific validation errors.',
+                    stack: error.stack
+                });
                 statusUpdates.push({ id: event.id, status: 'FAILED' });
             }
         }
@@ -101,7 +153,15 @@ class TransactionalOutboxPublisher {
                 await this._handleDirectoryAnalysisFinding(event);
                 statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
             } catch (error) {
-                console.error(`[TransactionalOutboxPublisher] Failed to publish directory event ${event.id}:`, error);
+                console.error(`[TransactionalOutboxPublisher] Failed to publish directory event:`, {
+                    eventId: event.id,
+                    eventType: event.event_type,
+                    error: error.message,
+                    errorType: error.name,
+                    directoryPath: event.payload ? JSON.parse(event.payload).directoryPath : 'unknown',
+                    action: 'Verify directory analysis data structure and database write permissions.',
+                    stack: error.stack
+                });
                 statusUpdates.push({ id: event.id, status: 'FAILED' });
             }
         }
@@ -114,6 +174,11 @@ class TransactionalOutboxPublisher {
         // Process global relationship events AFTER intra-file relationships
         if (globalRelationshipEvents.length > 0) {
             await this._handleBatchedGlobalRelationshipFindings(globalRelationshipEvents);
+        }
+        
+        // Process confidence escalation events
+        if (confidenceEscalationEvents.length > 0) {
+            await this._handleConfidenceEscalationEvents(confidenceEscalationEvents);
         }
         
         // Check if we should trigger global cross-file analysis
@@ -133,7 +198,16 @@ class TransactionalOutboxPublisher {
                 }
                 statusUpdates.push({ id: event.id, status: 'PUBLISHED' });
             } catch (error) {
-                console.error(`[TransactionalOutboxPublisher] Failed to publish event ${event.id}:`, error);
+                console.error(`[TransactionalOutboxPublisher] Failed to publish event to queue:`, {
+                    eventId: event.id,
+                    eventType: event.event_type,
+                    targetQueue: queueName || 'none',
+                    error: error.message,
+                    errorType: error.name,
+                    payloadSize: event.payload ? event.payload.length : 0,
+                    action: `Check queue connectivity and payload validity. Queue: ${queueName}, Event type: ${event.event_type}`,
+                    stack: error.stack
+                });
                 statusUpdates.push({ id: event.id, status: 'FAILED' });
             }
         }
@@ -159,12 +233,29 @@ class TransactionalOutboxPublisher {
                 try {
                     // Validate required POI fields
                     if (!poi.name || typeof poi.name !== 'string') {
-                        console.warn(`[TransactionalOutboxPublisher] Invalid POI missing name, skipping:`, poi);
+                        console.warn(`[TransactionalOutboxPublisher] Invalid POI structure - missing or invalid 'name' field:`, {
+                            filePath,
+                            poiId: poi.id || 'no-id',
+                            poiType: poi.type || 'unknown',
+                            providedName: poi.name,
+                            nameType: typeof poi.name,
+                            action: 'Ensure LLM response includes valid "name" field (string) for all POIs',
+                            poiSnapshot: JSON.stringify(poi).substring(0, 200)
+                        });
                         continue;
                     }
                     
                     if (!poi.type || typeof poi.type !== 'string') {
-                        console.warn(`[TransactionalOutboxPublisher] Invalid POI missing type, skipping:`, poi);
+                        console.warn(`[TransactionalOutboxPublisher] Invalid POI structure - missing or invalid 'type' field:`, {
+                            filePath,
+                            poiId: poi.id || 'no-id',
+                            poiName: poi.name,
+                            providedType: poi.type,
+                            typeType: typeof poi.type,
+                            validTypes: 'ClassDefinition, FunctionDefinition, VariableDeclaration, ImportStatement',
+                            action: 'Ensure LLM response includes valid "type" field from allowed values',
+                            poiSnapshot: JSON.stringify(poi).substring(0, 200)
+                        });
                         continue;
                     }
 
@@ -175,11 +266,11 @@ class TransactionalOutboxPublisher {
                         console.warn(`[TransactionalOutboxPublisher] POI ${poi.name} missing description, using name as fallback`);
                     }
 
-                    let isExported = poi.isExported || poi.is_exported;
+                    let isExported = poi.is_exported !== undefined ? poi.is_exported : poi.isExported;
                     if (typeof isExported !== 'boolean') {
-                        isExported = false; // Default to false
-                        if (isExported !== undefined) {
-                            console.warn(`[TransactionalOutboxPublisher] POI ${poi.name} has invalid is_exported value, defaulting to false`);
+                        isExported = false; // Default to false  
+                        if (poi.is_exported !== undefined || poi.isExported !== undefined) {
+                            console.warn(`[TransactionalOutboxPublisher] POI ${poi.name} has invalid is_exported/isExported value, defaulting to false`);
                         }
                     }
 
@@ -188,7 +279,7 @@ class TransactionalOutboxPublisher {
                     hash.update(filePath);
                     hash.update(poi.name);
                     hash.update(poi.type);
-                    hash.update(String(poi.startLine || poi.start_line || 0));
+                    hash.update(String(poi.start_line || poi.startLine || 0));
                     const poiHash = hash.digest('hex');
                     
                     // Get or create file_id for this file path
@@ -200,7 +291,7 @@ class TransactionalOutboxPublisher {
                     }
 
                     if (!fileRecord || !fileRecord.id) {
-                        throw new Error(`Failed to get or create file record for ${filePath}`);
+                        throw new Error(`[TransactionalOutboxPublisher] Failed to get or create file record. FilePath: ${filePath}, RunId: ${runId}. Check database connectivity and 'files' table structure.`);
                     }
                     
                     this.batchWriter.addPoiInsert({
@@ -208,17 +299,34 @@ class TransactionalOutboxPublisher {
                         filePath: filePath,
                         name: poi.name.trim(),
                         type: poi.type.toLowerCase(),
-                        startLine: poi.startLine || poi.start_line || 1,
-                        endLine: poi.endLine || poi.end_line || (poi.startLine || poi.start_line || 1),
+                        startLine: poi.start_line || poi.startLine || 1,
+                        endLine: poi.end_line || poi.endLine || poi.start_line || poi.startLine || 1,
                         description: description.trim(),
                         isExported: isExported,
-                        semanticId: poi.semantic_id || null,
+                        semanticId: poi.semantic_id || poi.semanticId || null,
                         llmOutput: JSON.stringify(poi),
                         hash: poiHash,
                         runId: runId
                     });
                 } catch (error) {
-                    console.error(`[TransactionalOutboxPublisher] Error processing POI ${poi.name || 'unknown'}:`, error);
+                    console.error(`[TransactionalOutboxPublisher] Error processing individual POI:`, {
+                        poiName: poi.name || 'unknown',
+                        poiType: poi.type || 'unknown',
+                        filePath,
+                        runId,
+                        error: error.message,
+                        errorType: error.name,
+                        errorCode: error.code,
+                        action: 'Check database schema, constraints, and data types. Verify POI data meets all requirements.',
+                        poiData: {
+                            hasSemanticId: !!(poi.semantic_id || poi.semanticId),
+                            hasDescription: !!poi.description,
+                            isExported: poi.is_exported !== undefined ? poi.is_exported : poi.isExported,
+                            startLine: poi.start_line || poi.startLine,
+                            endLine: poi.end_line || poi.endLine
+                        },
+                        stack: error.stack
+                    });
                     // Continue processing other POIs instead of failing the entire batch
                 }
             }
@@ -239,17 +347,21 @@ class TransactionalOutboxPublisher {
                 return;
             }
             
-            // Create relationship resolution jobs with proper database IDs
+            // Create relationship resolution jobs - batch POIs by file for efficiency
             const queue = this.queueManager.getQueue('relationship-resolution-queue');
-            for (const primaryPoi of insertedPois) {
+            
+            // Instead of one job per POI, create batched jobs to reduce total job count
+            const batchSize = Math.min(5, insertedPois.length); // Max 5 POIs per job
+            for (let i = 0; i < insertedPois.length; i += batchSize) {
+                const batch = insertedPois.slice(i, i + batchSize);
                 const jobPayload = {
-                    type: 'relationship-analysis-poi',
+                    type: 'relationship-analysis-batch',
                     source: 'TransactionalOutboxPublisher',
-                    jobId: `poi-${primaryPoi.id}`,
+                    jobId: `batch-${filePath.replace(/[^a-zA-Z0-9]/g, '_')}-${i}`,
                     runId: runId,
                     filePath: filePath,
-                    primaryPoi: primaryPoi,
-                    contextualPois: insertedPois.filter(p => p.id !== primaryPoi.id)
+                    poisBatch: batch,
+                    allPois: insertedPois // Provide full context for relationships
                 };
                 await queue.add(jobPayload.type, jobPayload);
             }
@@ -260,8 +372,13 @@ class TransactionalOutboxPublisher {
         const payload = JSON.parse(event.payload);
         const { runId, directoryPath, summary } = payload;
 
-        if (!directoryPath || !summary) {
-            console.warn(`[TransactionalOutboxPublisher] Invalid directory analysis finding missing required fields:`, payload);
+        if (!runId || !directoryPath) {
+            console.warn(`[TransactionalOutboxPublisher] Invalid directory analysis finding missing required fields:`, {
+                runId: runId || 'undefined',
+                directoryPath: directoryPath || 'undefined',
+                summary: summary ? 'present' : 'undefined',
+                payload
+            });
             return;
         }
 
@@ -347,7 +464,7 @@ class TransactionalOutboxPublisher {
                             sourcePoiId: sourcePoi.id,
                             targetPoiId: targetPoi.id,
                             type: relationship.type.toUpperCase(),
-                            filePath: relationship.filePath || relationship.file_path || '',
+                            filePath: relationship.filePath || relationship.file_path || relationship.filepath || '',
                             status: 'PENDING', // Will be updated to VALIDATED by ReconciliationWorker
                             confidence: confidence,
                             reason: reason.trim(),
@@ -365,6 +482,13 @@ class TransactionalOutboxPublisher {
                 }
             }
             
+            // Flush relationships to database before creating validation jobs
+            await this.batchWriter.flush();
+            console.log(`[TransactionalOutboxPublisher] Flushed relationships to database`);
+            
+            // Perform confidence scoring and trigger triangulated analysis for low-confidence relationships
+            await this._performConfidenceScoringAndTriangulation(runId);
+            
             const batchedPayload = allRelationships.map(relationship => {
                 const hash = crypto.createHash('md5');
                 hash.update(relationship.from);
@@ -377,6 +501,17 @@ class TransactionalOutboxPublisher {
                     evidencePayload: relationship,
                 };
             });
+
+            // Store expected evidence counts in database instead of Redis
+            const relationshipCounts = {};
+            for (const item of batchedPayload) {
+                relationshipCounts[item.relationshipHash] = (relationshipCounts[item.relationshipHash] || 0) + 1;
+            }
+
+            // Store expected counts in database
+            await this._storeRelationshipEvidenceCounts(runId, relationshipCounts);
+            
+            console.log(`[TransactionalOutboxPublisher] Set expected counts for ${Object.keys(relationshipCounts).length} unique relationships in database`);
 
             try {
                 await queue.add('validate-relationships-batch', {
@@ -407,6 +542,9 @@ class TransactionalOutboxPublisher {
             case 'global-relationship-analysis-finding':
             case 'directory-analysis-finding':
                 return null;
+            case 'relationship-confidence-escalation':
+                // Handle confidence escalation events
+                return 'triangulated-analysis-queue';
             default:
                 console.warn(`[TransactionalOutboxPublisher] No queue configured for event type: ${eventType}`);
                 return null;
@@ -489,7 +627,7 @@ class TransactionalOutboxPublisher {
                             sourcePoiId: sourcePoi.id,
                             targetPoiId: targetPoi.id,
                             type: relationship.type.toUpperCase(),
-                            filePath: relationship.from_file || relationship.to_file || '',
+                            filePath: relationship.from_file || relationship.fromFile || relationship.to_file || relationship.toFile || '',
                             status: 'CROSS_FILE_VALIDATED', // Special status for cross-file relationships
                             confidence: confidence,
                             reason: reason.trim(),
@@ -512,6 +650,53 @@ class TransactionalOutboxPublisher {
             this.batchWriter.addOutboxUpdatesBatch(publishedUpdates);
             
             console.log(`[TransactionalOutboxPublisher] Published cross-file relationships and queued ${events.length} events for status update.`);
+        }
+    }
+
+    /**
+     * Handle confidence escalation events from relationship resolution worker
+     */
+    async _handleConfidenceEscalationEvents(events) {
+        console.log(`[TransactionalOutboxPublisher] Processing ${events.length} confidence escalation events`);
+        
+        const db = this.dbManager.getDb();
+        const lowConfidenceRelationships = [];
+        let runId = null;
+        
+        for (const event of events) {
+            try {
+                const payload = JSON.parse(event.payload);
+                if (!runId) runId = payload.runId;
+                
+                // Get the relationship details from database
+                const relationship = db.prepare(`
+                    SELECT r.id, r.confidence, r.reason
+                    FROM relationships r
+                    WHERE r.id = ?
+                `).get(payload.relationshipId);
+                
+                if (relationship) {
+                    lowConfidenceRelationships.push({
+                        id: relationship.id,
+                        confidence: payload.confidence || relationship.confidence,
+                        confidenceLevel: payload.confidenceLevel || 'LOW',
+                        escalationReason: payload.escalationReason || 'manual_escalation'
+                    });
+                }
+                
+                // Mark event as processed
+                db.prepare('UPDATE outbox SET status = ? WHERE id = ?').run('PUBLISHED', event.id);
+                
+            } catch (error) {
+                console.error(`[TransactionalOutboxPublisher] Failed to process confidence escalation event:`, error);
+                db.prepare('UPDATE outbox SET status = ? WHERE id = ?').run('FAILED', event.id);
+            }
+        }
+        
+        // Trigger triangulated analysis for all escalated relationships
+        if (lowConfidenceRelationships.length > 0 && runId) {
+            console.log(`[TransactionalOutboxPublisher] Triggering triangulated analysis for ${lowConfidenceRelationships.length} escalated relationships`);
+            await this.triangulatedAnalysisQueue.triggerTriangulatedAnalysis(lowConfidenceRelationships, runId, 'high');
         }
     }
 
@@ -582,17 +767,23 @@ class TransactionalOutboxPublisher {
     async _triggerGlobalAnalysisForRun(runId) {
         const db = this.dbManager.getDb();
         
-        // Get all unique directories for this run
-        const directories = db.prepare(`
-            SELECT DISTINCT 
-                CASE 
-                    WHEN file_path LIKE '%/%' THEN SUBSTR(file_path, 1, LENGTH(file_path) - LENGTH(SUBSTR(file_path, INSTR(file_path, '/', -1) + 1)))
-                    WHEN file_path LIKE '%\\%' THEN SUBSTR(file_path, 1, LENGTH(file_path) - LENGTH(SUBSTR(file_path, INSTR(file_path, '\\', -1) + 1)))
-                    ELSE '.'
-                END as directory_path
+        // Get all unique file paths for this run, then extract directories in JavaScript
+        const filePaths = db.prepare(`
+            SELECT DISTINCT file_path
             FROM pois 
             WHERE run_id = ?
         `).all(runId);
+        
+        // Extract unique directories using JavaScript
+        const uniqueDirectories = new Set();
+        for (const row of filePaths) {
+            const filePath = row.file_path;
+            const lastSlash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+            const directoryPath = lastSlash >= 0 ? filePath.substring(0, lastSlash) : '.';
+            uniqueDirectories.add(directoryPath);
+        }
+        
+        const directories = Array.from(uniqueDirectories).map(dir => ({ directory_path: dir }));
         
         const globalAnalysisQueue = this.queueManager.getQueue('global-relationship-analysis-queue');
         
@@ -664,6 +855,275 @@ class TransactionalOutboxPublisher {
      */
     checkpointWAL() {
         return this.batchWriter.checkpointWAL();
+    }
+    
+    /**
+     * Perform confidence scoring and trigger triangulated analysis for low-confidence relationships
+     * Part of the hybrid cognitive triangulation architecture
+     */
+    async _performConfidenceScoringAndTriangulation(runId) {
+        try {
+            console.log(`[TransactionalOutboxPublisher] Starting confidence scoring and triangulation for run ${runId}`);
+            
+            const db = this.dbManager.getDb();
+            
+            // Get relationships that need confidence scoring (status = PENDING)
+            const relationships = db.prepare(`
+                SELECT r.id, r.source_poi_id, r.target_poi_id, r.type, r.file_path, 
+                       r.confidence, r.reason, r.run_id,
+                       sp.name as source_name, sp.semantic_id as source_semantic_id,
+                       tp.name as target_name, tp.semantic_id as target_semantic_id
+                FROM relationships r
+                JOIN pois sp ON r.source_poi_id = sp.id
+                JOIN pois tp ON r.target_poi_id = tp.id
+                WHERE r.run_id = ? AND r.status = 'PENDING'
+                ORDER BY r.confidence ASC
+            `).all(runId);
+            
+            if (relationships.length === 0) {
+                console.log(`[TransactionalOutboxPublisher] No relationships to score for run ${runId}`);
+                return;
+            }
+            
+            console.log(`[TransactionalOutboxPublisher] Scoring ${relationships.length} relationships for confidence`);
+            
+            const lowConfidenceRelationships = [];
+            const batchUpdates = [];
+            
+            for (const relationship of relationships) {
+                try {
+                    // Prepare relationship data for confidence scoring
+                    const relationshipData = {
+                        from: relationship.source_semantic_id || relationship.source_name,
+                        to: relationship.target_semantic_id || relationship.target_name,
+                        type: relationship.type,
+                        filePath: relationship.file_path,
+                        reason: relationship.reason
+                    };
+                    
+                    // Calculate confidence score using ConfidenceScorer
+                    const confidenceResult = this.confidenceScorer.calculateConfidence(relationshipData, []);
+                    
+                    const newConfidence = confidenceResult.finalConfidence;
+                    const confidenceLevel = confidenceResult.confidenceLevel;
+                    
+                    // Update relationship with new confidence score
+                    batchUpdates.push({
+                        id: relationship.id,
+                        confidence: newConfidence,
+                        status: confidenceLevel === 'HIGH' || confidenceLevel === 'MEDIUM' ? 'VALIDATED' : 'PENDING'
+                    });
+                    
+                    // Check if relationship needs triangulated analysis
+                    if (confidenceResult.escalationNeeded || newConfidence < 0.45) {
+                        lowConfidenceRelationships.push({
+                            id: relationship.id,
+                            confidence: newConfidence,
+                            confidenceLevel: confidenceLevel,
+                            escalationReason: confidenceResult.escalationNeeded ? 'confidence_scorer_escalation' : 'low_confidence_threshold'
+                        });
+                        
+                        console.log(`[TransactionalOutboxPublisher] Relationship ${relationship.source_name} -> ${relationship.target_name} needs triangulation - Confidence: ${newConfidence.toFixed(3)} (${confidenceLevel})`);
+                    }
+                    
+                } catch (error) {
+                    console.error(`[TransactionalOutboxPublisher] Failed to score confidence for relationship ${relationship.id}:`, error);
+                    
+                    // Mark as low confidence for triangulation due to scoring error
+                    batchUpdates.push({
+                        id: relationship.id,
+                        confidence: 0.1,
+                        status: 'PENDING'
+                    });
+                    
+                    lowConfidenceRelationships.push({
+                        id: relationship.id,
+                        confidence: 0.1,
+                        confidenceLevel: 'ERROR',
+                        escalationReason: 'confidence_scoring_error'
+                    });
+                }
+            }
+            
+            // Batch update relationship confidences
+            if (batchUpdates.length > 0) {
+                const updateStmt = db.prepare(`
+                    UPDATE relationships 
+                    SET confidence = ?, status = ?
+                    WHERE id = ?
+                `);
+                
+                const transaction = db.transaction(() => {
+                    for (const update of batchUpdates) {
+                        updateStmt.run(update.confidence, update.status, update.id);
+                    }
+                });
+                
+                transaction();
+                console.log(`[TransactionalOutboxPublisher] Updated confidence scores for ${batchUpdates.length} relationships`);
+            }
+            
+            // Trigger triangulated analysis for low-confidence relationships
+            if (lowConfidenceRelationships.length > 0) {
+                console.log(`[TransactionalOutboxPublisher] Triggering triangulated analysis for ${lowConfidenceRelationships.length} low-confidence relationships`);
+                
+                // Categorize relationships by confidence level for prioritization
+                const urgentRelationships = lowConfidenceRelationships.filter(r => r.confidence < 0.2);
+                const highPriorityRelationships = lowConfidenceRelationships.filter(r => r.confidence >= 0.2 && r.confidence < 0.35);
+                const normalPriorityRelationships = lowConfidenceRelationships.filter(r => r.confidence >= 0.35);
+                
+                // Trigger analysis with appropriate priorities
+                if (urgentRelationships.length > 0) {
+                    await this.triangulatedAnalysisQueue.triggerTriangulatedAnalysis(urgentRelationships, runId, 'urgent');
+                }
+                
+                if (highPriorityRelationships.length > 0) {
+                    await this.triangulatedAnalysisQueue.triggerTriangulatedAnalysis(highPriorityRelationships, runId, 'high');
+                }
+                
+                if (normalPriorityRelationships.length > 0) {
+                    await this.triangulatedAnalysisQueue.triggerTriangulatedAnalysis(normalPriorityRelationships, runId, 'normal');
+                }
+                
+                console.log(`[TransactionalOutboxPublisher] Triangulated analysis triggered: ${urgentRelationships.length} urgent, ${highPriorityRelationships.length} high, ${normalPriorityRelationships.length} normal priority`);
+            } else {
+                console.log(`[TransactionalOutboxPublisher] No relationships require triangulated analysis for run ${runId}`);
+            }
+            
+        } catch (error) {
+            console.error(`[TransactionalOutboxPublisher] Failed to perform confidence scoring and triangulation for run ${runId}:`, error);
+        }
+    }
+    
+    /**
+     * Store relationship evidence counts in database
+     * Replaces Redis rel_map functionality
+     */
+    async _storeRelationshipEvidenceCounts(runId, relationshipCounts) {
+        const db = this.dbManager.getDb();
+        
+        // Create table if it doesn't exist
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS relationship_evidence_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                relationship_hash TEXT NOT NULL,
+                expected_count INTEGER NOT NULL,
+                actual_count INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, relationship_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rel_evidence_tracking_run_id ON relationship_evidence_tracking(run_id);
+            CREATE INDEX IF NOT EXISTS idx_rel_evidence_tracking_hash ON relationship_evidence_tracking(relationship_hash);
+        `);
+        
+        // Prepare statements for upsert
+        const upsertStmt = db.prepare(`
+            INSERT INTO relationship_evidence_tracking (run_id, relationship_hash, expected_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(run_id, relationship_hash) 
+            DO UPDATE SET 
+                expected_count = expected_count + excluded.expected_count,
+                updated_at = CURRENT_TIMESTAMP
+        `);
+        
+        // Use transaction for atomic updates
+        const transaction = db.transaction(() => {
+            for (const [hash, count] of Object.entries(relationshipCounts)) {
+                upsertStmt.run(runId, hash, count);
+            }
+        });
+        
+        transaction();
+    }
+    
+    /**
+     * Get relationship evidence tracking data from database
+     * Replaces Redis rel_map reads
+     */
+    async _getRelationshipEvidenceTracking(runId) {
+        const db = this.dbManager.getDb();
+        
+        const tracking = db.prepare(`
+            SELECT relationship_hash, expected_count, actual_count
+            FROM relationship_evidence_tracking
+            WHERE run_id = ?
+        `).all(runId);
+        
+        // Convert to map format for compatibility
+        const trackingMap = {};
+        for (const row of tracking) {
+            trackingMap[row.relationship_hash] = {
+                expected: row.expected_count,
+                actual: row.actual_count
+            };
+        }
+        
+        return trackingMap;
+    }
+    
+    /**
+     * Update actual count for relationship evidence
+     */
+    async _updateRelationshipEvidenceActualCount(runId, relationshipHash, increment = 1) {
+        const db = this.dbManager.getDb();
+        
+        db.prepare(`
+            UPDATE relationship_evidence_tracking 
+            SET actual_count = actual_count + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = ? AND relationship_hash = ?
+        `).run(increment, runId, relationshipHash);
+    }
+
+    /**
+     * Get triangulated analysis statistics
+     */
+    async getTriangulatedAnalysisStats() {
+        try {
+            const triangulationStats = await this.triangulatedAnalysisQueue.getStats();
+            
+            // Get database statistics for triangulated analysis
+            const db = this.dbManager.getDb();
+            
+            const sessionStats = db.prepare(`
+                SELECT 
+                    status,
+                    COUNT(*) as count
+                FROM triangulated_analysis_sessions
+                GROUP BY status
+            `).all();
+            
+            const consensusStats = db.prepare(`
+                SELECT 
+                    final_decision,
+                    COUNT(*) as count,
+                    AVG(weighted_consensus) as avg_consensus
+                FROM consensus_decisions
+                GROUP BY final_decision
+            `).all();
+            
+            return {
+                triangulationQueue: triangulationStats,
+                sessions: sessionStats.reduce((acc, stat) => {
+                    acc[stat.status] = stat.count;
+                    return acc;
+                }, {}),
+                decisions: consensusStats.reduce((acc, stat) => {
+                    acc[stat.final_decision] = {
+                        count: stat.count,
+                        averageConsensus: stat.avg_consensus
+                    };
+                    return acc;
+                }, {}),
+                confidenceScorer: this.confidenceScorer.getHealthStatus ? this.confidenceScorer.getHealthStatus() : 'not_available'
+            };
+            
+        } catch (error) {
+            console.error('[TransactionalOutboxPublisher] Failed to get triangulated analysis stats:', error);
+            return { error: error.message };
+        }
     }
 }
 

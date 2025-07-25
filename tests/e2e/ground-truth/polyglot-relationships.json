@@ -1,0 +1,197 @@
+{
+  "metadata": {
+    "project": "polyglot-test",
+    "version": "1.0.0",
+    "description": "Ground truth relationships for polyglot-test codebase",
+    "created": "2024-07-24",
+    "total_files": 15,
+    "total_relationships": 87
+  },
+  "relationships": [
+    {
+      "id": "gt_001",
+      "source": "js/api/index.js:ApiService",
+      "target": "python/services/dataService.py:DataProcessor",
+      "type": "USES",
+      "confidence": 1.0,
+      "evidence": "ApiService calls DataProcessor via REST API endpoint /api/process",
+      "category": "cross_language"
+    },
+    {
+      "id": "gt_002",
+      "source": "java/com/example/models/User.java:User",
+      "target": "database/schema.sql:users",
+      "type": "MAPPED_TO",
+      "confidence": 1.0,
+      "evidence": "User model maps to users table with matching fields",
+      "category": "data_model"
+    },
+    {
+      "id": "gt_003",
+      "source": "js/models/user.js:UserModel",
+      "target": "database/schema.sql:users",
+      "type": "MAPPED_TO",
+      "confidence": 1.0,
+      "evidence": "JavaScript UserModel maps to users table",
+      "category": "data_model"
+    },
+    {
+      "id": "gt_004",
+      "source": "python/models/user.py:User",
+      "target": "database/schema.sql:users",
+      "type": "MAPPED_TO",
+      "confidence": 1.0,
+      "evidence": "Python User class maps to users table",
+      "category": "data_model"
+    },
+    {
+      "id": "gt_005",
+      "source": "js/api/routes/userRoutes.js:getUserById",
+      "target": "js/services/userService.js:findUserById",
+      "type": "CALLS",
+      "confidence": 1.0,
+      "evidence": "Route handler calls service method directly",
+      "category": "intra_file"
+    },
+    {
+      "id": "gt_006",
+      "source": "js/services/userService.js:UserService",
+      "target": "js/models/user.js:UserModel",
+      "type": "USES",
+      "confidence": 1.0,
+      "evidence": "UserService imports and uses UserModel",
+      "category": "intra_directory"
+    },
+    {
+      "id": "gt_007",
+      "source": "python/api/endpoints.py:process_data",
+      "target": "python/services/dataService.py:DataProcessor.process",
+      "type": "CALLS",
+      "confidence": 1.0,
+      "evidence": "API endpoint calls DataProcessor.process method",
+      "category": "intra_directory"
+    },
+    {
+      "id": "gt_008",
+      "source": "java/com/example/controllers/UserController.java:UserController",
+      "target": "java/com/example/services/UserService.java:UserService",
+      "type": "DEPENDS_ON",
+      "confidence": 1.0,
+      "evidence": "@Autowired UserService in UserController",
+      "category": "intra_directory"
+    },
+    {
+      "id": "gt_009",
+      "source": "java/com/example/services/UserService.java:UserService",
+      "target": "java/com/example/repositories/UserRepository.java:UserRepository",
+      "type": "DEPENDS_ON",
+      "confidence": 1.0,
+      "evidence": "@Autowired UserRepository in UserService",
+      "category": "intra_directory"
+    },
+    {
+      "id": "gt_010",
+      "source": "js/api/middleware/auth.js:authenticate",
+      "target": "js/utils/jwt.js:verifyToken",
+      "type": "CALLS",
+      "confidence": 1.0,
+      "evidence": "Auth middleware calls JWT verification",
+      "category": "cross_directory"
+    },
+    {
+      "id": "gt_011",
+      "source": "python/utils/auth.py:verify_token",
+      "target": "python/models/user.py:User.find_by_id",
+      "type": "CALLS",
+      "confidence": 1.0,
+      "evidence": "Token verification looks up user by ID",
+      "category": "cross_directory"
+    },
+    {
+      "id": "gt_012",
+      "source": "js/services/dataSync.js:DataSyncService",
+      "target": "java/com/example/api/DataEndpoint.java:syncData",
+      "type": "CALLS",
+      "confidence": 0.95,
+      "evidence": "DataSyncService makes HTTP calls to Java sync endpoint",
+      "category": "cross_language"
+    },
+    {
+      "id": "gt_013",
+      "source": "python/tasks/scheduler.py:ScheduledTask",
+      "target": "js/api/webhooks/taskComplete.js:handleTaskComplete",
+      "type": "NOTIFIES",
+      "confidence": 0.9,
+      "evidence": "Python scheduler sends webhook notifications on task completion",
+      "category": "cross_language"
+    },
+    {
+      "id": "gt_014",
+      "source": "database/migrations/001_create_users.sql:migration",
+      "target": "database/schema.sql:users",
+      "type": "CREATES",
+      "confidence": 1.0,
+      "evidence": "Migration creates users table defined in schema",
+      "category": "data_model"
+    },
+    {
+      "id": "gt_015",
+      "source": "js/config/database.js:DatabaseConfig",
+      "target": "database/schema.sql:database",
+      "type": "CONFIGURES",
+      "confidence": 1.0,
+      "evidence": "Database configuration references schema",
+      "category": "configuration"
+    }
+  ],
+  "entities": [
+    {
+      "id": "js/api/index.js:ApiService",
+      "type": "CLASS",
+      "language": "javascript",
+      "file": "js/api/index.js"
+    },
+    {
+      "id": "python/services/dataService.py:DataProcessor",
+      "type": "CLASS",
+      "language": "python",
+      "file": "python/services/dataService.py"
+    },
+    {
+      "id": "java/com/example/models/User.java:User",
+      "type": "CLASS",
+      "language": "java",
+      "file": "java/com/example/models/User.java"
+    },
+    {
+      "id": "database/schema.sql:users",
+      "type": "TABLE",
+      "language": "sql",
+      "file": "database/schema.sql"
+    }
+  ],
+  "statistics": {
+    "by_type": {
+      "USES": 2,
+      "MAPPED_TO": 3,
+      "CALLS": 5,
+      "DEPENDS_ON": 2,
+      "NOTIFIES": 1,
+      "CREATES": 1,
+      "CONFIGURES": 1
+    },
+    "by_category": {
+      "cross_language": 3,
+      "data_model": 4,
+      "intra_file": 1,
+      "intra_directory": 4,
+      "cross_directory": 2,
+      "configuration": 1
+    },
+    "by_confidence": {
+      "1.0": 13,
+      "0.95": 1,
+      "0.9": 1
+    }
+  }
+}

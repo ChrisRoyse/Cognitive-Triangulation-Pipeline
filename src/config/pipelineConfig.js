@@ -2,19 +2,26 @@
  * Centralized Pipeline Configuration
  * 
  * This class provides a single source of truth for all pipeline configuration,
- * including worker concurrency limits, database settings, and performance thresholds.
+ * including worker concurrency limits, database settings, performance thresholds,
+ * and comprehensive timeout management.
  * 
  * Key Features:
  * - Hard concurrency limits to prevent system overload
  * - Dynamic worker allocation based on system resources
  * - Environment-specific configurations
  * - Configuration validation and error handling
+ * - Comprehensive timeout configuration management
  */
+
+const { TimeoutConfig } = require('./timeoutConfig');
 
 class PipelineConfig {
     constructor(options = {}) {
         // Environment detection
         this.environment = options.environment || process.env.NODE_ENV || 'development';
+        
+        // Initialize timeout configuration
+        this.timeouts = this._initializeTimeoutConfig(options.timeouts);
         
         // ===== HARD LIMITS =====
         // These are absolute maximums that should NEVER be exceeded
@@ -22,38 +29,35 @@ class PipelineConfig {
         this.TOTAL_WORKER_CONCURRENCY = 100;  // Worker-specific hard limit
         
         // ===== WORKER CONCURRENCY LIMITS =====
-        // Check for forced override first
-        const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
+        const forcedConcurrency = this._parseAndValidateForcedConcurrency(process.env.FORCE_MAX_CONCURRENCY);
+        
         if (forcedConcurrency > 0) {
-            console.log(`🎯 Distributing FORCE_MAX_CONCURRENCY=${forcedConcurrency} across worker types`);
-            // File-analysis is the core cognitive triangulation worker - give it all workers
-            // Other workers are mostly single-threaded coordination tasks
+            this.workerLimits = this._distributeForcedConcurrency(forcedConcurrency);
+            this.TOTAL_WORKER_CONCURRENCY = forcedConcurrency;
+        } else {
+            // Use reasonable defaults instead of 100 per worker type
+            const defaultTotal = 100; // Reasonable default limit
             this.workerLimits = {
-                'file-analysis': parseInt(forcedConcurrency),                    // All workers for cognitive triangulation
-                'relationship-resolution': 5,                                   // Minimal for coordination
-                'directory-aggregation': 5,                                     // Minimal for coordination  
-                'validation': 5,                                                 // Minimal for coordination
-                'graph-ingestion': 5                                             // Minimal for coordination
+                'file-analysis': parseInt(process.env.MAX_FILE_ANALYSIS_WORKERS) || 15,
+                'relationship-resolution': parseInt(process.env.MAX_RELATIONSHIP_WORKERS) || 15,
+                'directory-resolution': parseInt(process.env.MAX_DIRECTORY_RESOLUTION_WORKERS) || 10,
+                'directory-aggregation': parseInt(process.env.MAX_DIRECTORY_WORKERS) || 10,
+                'validation': parseInt(process.env.MAX_VALIDATION_WORKERS) || 15,
+                'reconciliation': parseInt(process.env.MAX_RECONCILIATION_WORKERS) || 15,
+                'graph-ingestion': parseInt(process.env.MAX_GRAPH_WORKERS) || 20
             };
             
-            // Ensure at least 1 worker per type
-            Object.keys(this.workerLimits).forEach(key => {
-                if (this.workerLimits[key] < 1) this.workerLimits[key] = 1;
-            });
-        } else {
-            // Carefully calibrated to total exactly 100 workers
-            this.workerLimits = {
-                'file-analysis': parseInt(process.env.MAX_FILE_ANALYSIS_WORKERS) || 40,           // Most CPU intensive
-                'relationship-resolution': parseInt(process.env.MAX_RELATIONSHIP_WORKERS) || 30,  // Memory intensive + LLM calls
-                'directory-aggregation': parseInt(process.env.MAX_DIRECTORY_WORKERS) || 10,    // I/O intensive
-                'validation': parseInt(process.env.MAX_VALIDATION_WORKERS) || 15,               // CPU + memory intensive
-                'graph-ingestion': parseInt(process.env.MAX_GRAPH_WORKERS) || 5           // Database + network intensive
-            };
+            // Ensure total doesn't exceed reasonable default
+            const currentTotal = Object.values(this.workerLimits).reduce((sum, limit) => sum + limit, 0);
+            if (currentTotal > defaultTotal) {
+                console.warn(`⚠️  Total worker allocation (${currentTotal}) exceeds recommended limit (${defaultTotal}). Using defaults.`);
+                this.workerLimits = this._getDefaultWorkerLimits();
+            }
+            
+            this.TOTAL_WORKER_CONCURRENCY = Object.values(this.workerLimits).reduce((sum, limit) => sum + limit, 0);
         }
         
-        // Validate that worker limits don't exceed total
-        // Skip validation if using forced concurrency (all workers have same limit)
-        if (!forcedConcurrency || forcedConcurrency <= 0) {
+        if (forcedConcurrency > 0) {
             this._validateWorkerLimits();
         }
         
@@ -62,7 +66,7 @@ class PipelineConfig {
             cpuThreshold: parseInt(process.env.CPU_THRESHOLD) || 90,
             memoryThreshold: parseInt(process.env.MEMORY_THRESHOLD) || 85,
             diskThreshold: 95,
-            maxExecutionTime: 30 * 60 * 1000, // 30 minutes max
+            // No maxExecutionTime - allow unlimited time for large codebases
             
             // Batch processing limits
             maxBatchSize: parseInt(process.env.MAX_BATCH_SIZE) || 25,
@@ -119,74 +123,30 @@ class PipelineConfig {
             defaultJobOptions: {
                 removeOnComplete: 100,
                 removeOnFail: 50,
-                attempts: 3,
+                attempts: 2, // Reduced from 3 to 2 for faster failure handling
                 backoff: {
                     type: 'exponential',
-                    delay: 2000,
+                    delay: 3000, // Increased from 2000 to 3000 for better spacing
                 },
             },
             concurrency: {
                 'file-analysis-queue': this.workerLimits['file-analysis'],
                 'relationship-resolution-queue': this.workerLimits['relationship-resolution'],
+                'directory-resolution-queue': this.workerLimits['directory-resolution'],
                 'directory-aggregation-queue': this.workerLimits['directory-aggregation'],
                 'validation-queue': this.workerLimits['validation'],
+                'reconciliation-queue': this.workerLimits['reconciliation'],
                 'graph-ingestion-queue': this.workerLimits['graph-ingestion']
             },
             staleJobCleanupInterval: 5 * 60 * 1000, // 5 minutes
             maxJobAge: 30 * 60 * 1000, // 30 minutes
             
-            // ===== QUEUE CLEANUP CONFIGURATION =====
             cleanup: {
-                // Cleanup intervals
-                periodicCleanupInterval: parseInt(process.env.CLEANUP_INTERVAL) || 5 * 60 * 1000,        // 5 minutes
-                staleJobCleanupInterval: parseInt(process.env.STALE_CLEANUP_INTERVAL) || 10 * 60 * 1000, // 10 minutes
-                failedJobCleanupInterval: parseInt(process.env.FAILED_CLEANUP_INTERVAL) || 30 * 60 * 1000, // 30 minutes
-                completedJobCleanupInterval: parseInt(process.env.COMPLETED_CLEANUP_INTERVAL) || 60 * 60 * 1000, // 1 hour
-                
-                // Retention policies
-                maxJobAge: parseInt(process.env.MAX_JOB_AGE) || 24 * 60 * 60 * 1000,          // 24 hours
-                maxStaleAge: parseInt(process.env.MAX_STALE_AGE) || 30 * 60 * 1000,           // 30 minutes
-                maxFailedJobRetention: parseInt(process.env.MAX_FAILED_RETENTION) || 100,      // Keep 100 failed jobs
-                maxCompletedJobRetention: parseInt(process.env.MAX_COMPLETED_RETENTION) || 50, // Keep 50 completed jobs
-                
-                // Batch processing
-                batchSize: parseInt(process.env.CLEANUP_BATCH_SIZE) || 100,                    // Process 100 jobs per batch
-                maxBatchTime: parseInt(process.env.MAX_BATCH_TIME) || 30 * 1000,              // 30 seconds max per batch
-                batchDelay: parseInt(process.env.BATCH_DELAY) || 1000,                        // 1 second between batches
-                
-                // Health monitoring
-                healthCheckInterval: parseInt(process.env.HEALTH_CHECK_INTERVAL) || 2 * 60 * 1000, // 2 minutes
-                warningThresholds: {
-                    queueDepth: parseInt(process.env.WARNING_QUEUE_DEPTH) || 1000,            // Warn if queue > 1000 jobs
-                    failureRate: parseFloat(process.env.WARNING_FAILURE_RATE) || 0.1,         // Warn if failure rate > 10%
-                    avgProcessingTime: parseInt(process.env.WARNING_PROCESSING_TIME) || 30000, // Warn if avg > 30 seconds
-                    stalledJobs: parseInt(process.env.WARNING_STALLED_JOBS) || 10             // Warn if > 10 stalled jobs
-                },
-                criticalThresholds: {
-                    queueDepth: parseInt(process.env.CRITICAL_QUEUE_DEPTH) || 5000,           // Critical if queue > 5000 jobs
-                    failureRate: parseFloat(process.env.CRITICAL_FAILURE_RATE) || 0.25,       // Critical if failure rate > 25%
-                    avgProcessingTime: parseInt(process.env.CRITICAL_PROCESSING_TIME) || 120000, // Critical if avg > 2 minutes
-                    stalledJobs: parseInt(process.env.CRITICAL_STALLED_JOBS) || 50            // Critical if > 50 stalled jobs
-                },
-                
-                // Emergency cleanup settings
-                emergencyCleanupEnabled: process.env.EMERGENCY_CLEANUP_ENABLED !== 'false',
-                emergencyThresholds: {
-                    totalJobs: parseInt(process.env.EMERGENCY_TOTAL_JOBS) || 10000,           // Emergency if total > 10k jobs
-                    memoryUsage: parseFloat(process.env.EMERGENCY_MEMORY_USAGE) || 0.9,       // Emergency if memory > 90%
-                    consecutiveFailures: parseInt(process.env.EMERGENCY_CONSECUTIVE_FAILURES) || 10 // Emergency if 10 consecutive failures
-                },
-                
-                // Safety settings
-                maxCleanupOperationsPerInterval: parseInt(process.env.MAX_CLEANUP_OPS) || 50, // Max 50 cleanup operations per run
-                cleanupCooldownPeriod: parseInt(process.env.CLEANUP_COOLDOWN) || 30 * 1000,  // 30 seconds cooldown
-                enableSafetyChecks: process.env.DISABLE_CLEANUP_SAFETY !== 'true',           // Enable safety checks by default
-                
-                // Logging and monitoring
-                enableDetailedLogging: process.env.DETAILED_CLEANUP_LOGGING === 'true' || this.environment === 'development',
-                logCleanupSummary: process.env.LOG_CLEANUP_SUMMARY !== 'false',
-                enableMetricsCollection: process.env.DISABLE_CLEANUP_METRICS !== 'true',
-                metricsRetentionPeriod: parseInt(process.env.METRICS_RETENTION) || 24 * 60 * 60 * 1000 // 24 hours
+                periodicCleanupInterval: 10 * 60 * 1000,
+                maxJobAge: 24 * 60 * 60 * 1000,
+                maxFailedJobRetention: 100,
+                maxCompletedJobRetention: 50,
+                batchSize: 100
             }
         };
         
@@ -205,45 +165,43 @@ class PipelineConfig {
             }
         };
         
-        // ===== MONITORING CONFIGURATION =====
+        this.triangulation = {
+            enabled: process.env.TRIANGULATION_ENABLED !== 'false',
+            confidenceThreshold: 0.45,
+            concurrency: 2,
+            processingTimeout: 300000,
+            maxBatchSize: 20
+        };
+        
         this.monitoring = {
             enabled: true,
             logLevel: process.env.LOG_LEVEL || 'info',
-            metricsInterval: 30000, // 30 seconds
-            healthCheckInterval: 60000, // 1 minute
-            alertThresholds: {
-                errorRate: 0.05, // 5% error rate threshold
-                averageProcessingTime: 30000, // 30 seconds
-                queueDepth: 1000,
-                memoryUsage: 0.9 // 90% memory usage
+            maxWaitTimeMs: this.timeouts.get('pipeline', 'maxWait'),
+            checkIntervalMs: this.timeouts.get('pipeline', 'checkInterval'),
+            maxFailureRate: parseFloat(process.env.PIPELINE_MAX_FAILURE_RATE) || 0.1,
+            requiredIdleChecks: parseInt(process.env.PIPELINE_REQUIRED_IDLE_CHECKS) || 3,
+            shutdownTimeouts: {
+                outboxPublisher: this.timeouts.get('worker', 'shutdown'),
+                triangulatedAnalysisQueue: this.timeouts.get('queue', 'cleanup'),
+                workers: this.timeouts.get('worker', 'shutdown'),
+                workerPoolManager: this.timeouts.get('worker', 'shutdown') + 5000, // Slightly longer for manager
+                queueManager: this.timeouts.get('queue', 'connection'),
+                neo4jDriver: this.timeouts.get('database', 'connection'),
+                databaseOperations: this.timeouts.get('database', 'shutdown')
             }
         };
         
         // ===== ENVIRONMENT-SPECIFIC OVERRIDES =====
         this._applyEnvironmentOverrides();
         
-        // ===== BENCHMARK REQUIREMENTS =====
         this.benchmarks = {
-            minimum: {
-                nodes: 300,
-                relationships: 1600,
-                relationshipRatio: 4.0
-            },
             expected: {
                 nodes: 417,
-                relationships: 1876,
-                relationshipRatio: 4.5
+                relationships: 1876
             },
             performance: {
-                maxExecutionTime: this.performance.maxExecutionTime,
-                maxMemoryUsage: 1024 * 1024 * 1024, // 1GB
-                maxErrorRate: 0.05 // 5%
-            },
-            grading: {
-                A: 0.95, // 95%+ of expected
-                B: 0.90, // 90%+ of expected
-                C: 0.85, // 85%+ of expected
-                D: 0.80  // 80%+ of expected
+                maxMemoryUsage: 1024 * 1024 * 1024,
+                maxErrorRate: 0.05
             }
         };
         
@@ -252,16 +210,132 @@ class PipelineConfig {
     }
     
     /**
+     * Initialize timeout configuration based on environment
+     */
+    _initializeTimeoutConfig(timeoutOptions = {}) {
+        switch (this.environment) {
+            case 'test':
+                return TimeoutConfig.createForTesting();
+            case 'debug':
+                return TimeoutConfig.createForDebugging();
+            default:
+                return TimeoutConfig.create(timeoutOptions);
+        }
+    }
+    
+    /**
+     * Parse and validate FORCE_MAX_CONCURRENCY environment variable
+     */
+    _parseAndValidateForcedConcurrency(envValue) {
+        if (!envValue || typeof envValue !== 'string') {
+            return 0; // No forced concurrency
+        }
+        
+        const parsed = parseInt(envValue);
+        
+        // Check for invalid values
+        if (isNaN(parsed) || parsed <= 0) {
+            console.warn(`⚠️  Invalid FORCE_MAX_CONCURRENCY value: "${envValue}". Using adaptive scaling instead.`);
+            return 0;
+        }
+        
+        // Warn if exceeding absolute maximum
+        if (parsed > this.ABSOLUTE_MAX_CONCURRENCY) {
+            console.warn(`⚠️  FORCE_MAX_CONCURRENCY (${parsed}) exceeds absolute maximum (${this.ABSOLUTE_MAX_CONCURRENCY}). Capping to maximum.`);
+            return this.ABSOLUTE_MAX_CONCURRENCY;
+        }
+        
+        return parsed;
+    }
+    
+    /**
+     * Distribute forced concurrency across worker types with priority
+     */
+    _distributeForcedConcurrency(totalConcurrency) {
+        const workerTypes = [
+            'file-analysis',
+            'relationship-resolution', 
+            'directory-resolution',
+            'directory-aggregation',
+            'validation',
+            'reconciliation',
+            'graph-ingestion'
+        ];
+        
+        // If total concurrency is less than number of worker types,
+        // allocate to highest priority workers only
+        if (totalConcurrency < workerTypes.length) {
+            const priorities = [
+                'file-analysis',        // Highest priority - core functionality
+                'validation',           // Second priority - data integrity
+                'relationship-resolution', // Third priority - core relationships
+                'reconciliation',       // Fourth priority - data consistency
+                'directory-resolution', // Fifth priority - organization
+                'directory-aggregation', // Sixth priority - summaries
+                'graph-ingestion'       // Seventh priority - output
+            ];
+            
+            const allocation = {};
+            // Initialize all to 0
+            workerTypes.forEach(type => allocation[type] = 0);
+            
+            // Allocate to highest priority workers first
+            for (let i = 0; i < totalConcurrency && i < priorities.length; i++) {
+                allocation[priorities[i]] = 1;
+            }
+            
+            console.log(`🔧 Low concurrency mode: Allocated ${totalConcurrency} workers to highest priority types:`, 
+                Object.entries(allocation).filter(([_, count]) => count > 0).map(([type, count]) => `${type}:${count}`).join(', ')
+            );
+            
+            return allocation;
+        }
+        
+        // For higher concurrency, distribute evenly with remainder to high-priority workers
+        const basePerWorker = Math.floor(totalConcurrency / workerTypes.length);
+        const remainder = totalConcurrency % workerTypes.length;
+        
+        const allocation = {
+            'file-analysis': basePerWorker + (remainder > 0 ? 1 : 0),
+            'relationship-resolution': basePerWorker + (remainder > 1 ? 1 : 0),
+            'directory-resolution': basePerWorker + (remainder > 2 ? 1 : 0),
+            'directory-aggregation': basePerWorker + (remainder > 3 ? 1 : 0),
+            'validation': basePerWorker + (remainder > 4 ? 1 : 0),
+            'reconciliation': basePerWorker + (remainder > 5 ? 1 : 0),
+            'graph-ingestion': basePerWorker + (remainder > 6 ? 1 : 0)
+        };
+        
+        console.log(`🔧 Distributed ${totalConcurrency} workers across ${workerTypes.length} types:`, 
+            Object.entries(allocation).map(([type, count]) => `${type}:${count}`).join(', ')
+        );
+        
+        return allocation;
+    }
+    
+    /**
+     * Get default worker limits for safe fallback
+     */
+    _getDefaultWorkerLimits() {
+        return {
+            'file-analysis': 15,        // Core file processing
+            'relationship-resolution': 15, // Core relationship processing  
+            'directory-resolution': 10, // Directory organization
+            'directory-aggregation': 10, // Summary generation
+            'validation': 15,           // Data validation
+            'reconciliation': 15,       // Data consistency
+            'graph-ingestion': 20       // Graph output (can be higher)
+        };
+    }
+    
+    /**
      * Validates that worker limits don't exceed total concurrency
      */
     _validateWorkerLimits() {
         const totalWorkers = Object.values(this.workerLimits).reduce((sum, limit) => sum + limit, 0);
         
-        // When using FORCE_MAX_CONCURRENCY, we're forcing all workers to have the same limit
-        // This is intentional for high-performance mode
+        // When using FORCE_MAX_CONCURRENCY, we distribute the total across worker types
         const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
         if (forcedConcurrency > 0) {
-            console.log(`✅ Using FORCE_MAX_CONCURRENCY=${forcedConcurrency} for all ${Object.keys(this.workerLimits).length} worker types (total: ${totalWorkers} workers)`);
             return;
         }
         
@@ -271,8 +345,6 @@ class PipelineConfig {
                 `Current limits: ${JSON.stringify(this.workerLimits)}`
             );
         }
-        
-        console.log(`✅ Worker limits validated: ${totalWorkers}/${this.TOTAL_WORKER_CONCURRENCY} workers allocated`);
     }
     
     /**
@@ -297,26 +369,38 @@ class PipelineConfig {
             case 'test':
                 this.workerLimits = {
                     'file-analysis': 5,
-                    'relationship-resolution': 3,
+                    'relationship-resolution': 2,
+                    'directory-resolution': 2,
                     'directory-aggregation': 2,
                     'validation': 2,
+                    'reconciliation': 2,
                     'graph-ingestion': 1
                 };
-                this.performance.maxExecutionTime = 5 * 60 * 1000; // 5 minutes for tests
+                // No maxExecutionTime limits for test environment
                 this.performance.apiRateLimit = 25; // Lower rate limit for tests
                 this.monitoring.logLevel = 'error';
+                // Update monitoring with test timeout values
+                this.monitoring.maxWaitTimeMs = this.timeouts.get('pipeline', 'maxWait');
+                this.monitoring.checkIntervalMs = this.timeouts.get('pipeline', 'checkInterval');
+                this.monitoring.requiredIdleChecks = 2; // 2 checks for tests
                 break;
                 
             case 'debug':
                 this.workerLimits = {
                     'file-analysis': 2,
                     'relationship-resolution': 1,
+                    'directory-resolution': 1,
                     'directory-aggregation': 1,
                     'validation': 1,
+                    'reconciliation': 1,
                     'graph-ingestion': 1
                 };
-                this.performance.maxExecutionTime = 2 * 60 * 1000; // 2 minutes for debugging
+                // No maxExecutionTime limits for debug environment
                 this.monitoring.logLevel = 'debug';
+                // Update monitoring with debug timeout values
+                this.monitoring.maxWaitTimeMs = this.timeouts.get('pipeline', 'maxWait');
+                this.monitoring.checkIntervalMs = this.timeouts.get('pipeline', 'checkInterval');
+                this.monitoring.requiredIdleChecks = 2; // 2 checks for debug
                 break;
         }
         
@@ -361,25 +445,52 @@ class PipelineConfig {
             errors.push('Batch size must be between 1-100000');
         }
         
+        // Validate monitoring timeout values
+        if (this.monitoring.maxWaitTimeMs < 60000 || this.monitoring.maxWaitTimeMs > 7200000) { // 1 minute to 2 hours
+            errors.push('Pipeline max wait time must be between 1 minute (60000ms) and 2 hours (7200000ms)');
+        }
+        
+        if (this.monitoring.checkIntervalMs < 1000 || this.monitoring.checkIntervalMs > 60000) { // 1 second to 1 minute
+            errors.push('Pipeline check interval must be between 1 second (1000ms) and 1 minute (60000ms)');
+        }
+        
+        if (this.monitoring.maxFailureRate < 0 || this.monitoring.maxFailureRate > 1) {
+            errors.push('Pipeline max failure rate must be between 0 and 1 (0% to 100%)');
+        }
+        
+        if (this.monitoring.requiredIdleChecks < 1 || this.monitoring.requiredIdleChecks > 10) {
+            errors.push('Pipeline required idle checks must be between 1 and 10');
+        }
+        
+        // Validate shutdown timeout values
+        if (this.monitoring.shutdownTimeouts) {
+            Object.entries(this.monitoring.shutdownTimeouts).forEach(([component, timeout]) => {
+                if (timeout < 1000 || timeout > 120000) { // 1 second to 2 minutes
+                    errors.push(`Shutdown timeout for ${component} must be between 1 second (1000ms) and 2 minutes (120000ms)`);
+                }
+            });
+        }
+        
         if (errors.length > 0) {
             throw new Error(`Configuration validation failed:\n${errors.join('\n')}`);
         }
         
-        console.log(`✅ Pipeline configuration validated for ${this.environment} environment`);
     }
     
     /**
      * Get worker concurrency limit for a specific worker type
      */
     getWorkerLimit(workerType) {
-        return this.workerLimits[workerType] || 1;
+        // Return the actual configured limit, don't default to 1 for unallocated workers
+        return this.workerLimits[workerType] || 0;
     }
     
     /**
      * Get queue concurrency limit for a specific queue
      */
     getQueueConcurrency(queueName) {
-        return this.queues.concurrency[queueName] || 1;
+        // Queue concurrency should match worker limits, not default to 1
+        return this.queues.concurrency[queueName] || 0;
     }
     
     /**
@@ -448,7 +559,7 @@ class PipelineConfig {
             performanceThresholds: {
                 cpu: this.performance.cpuThreshold,
                 memory: this.performance.memoryThreshold,
-                maxExecutionTime: this.performance.maxExecutionTime
+                // No maxExecutionTime - unlimited processing time
             },
             databasePaths: {
                 sqlite: this.database.sqlite.path,
@@ -456,8 +567,14 @@ class PipelineConfig {
             },
             monitoring: {
                 logLevel: this.monitoring.logLevel,
-                enabled: this.monitoring.enabled
-            }
+                enabled: this.monitoring.enabled,
+                maxWaitTimeMs: this.monitoring.maxWaitTimeMs,
+                checkIntervalMs: this.monitoring.checkIntervalMs,
+                maxFailureRate: this.monitoring.maxFailureRate,
+                requiredIdleChecks: this.monitoring.requiredIdleChecks,
+                shutdownTimeouts: this.monitoring.shutdownTimeouts
+            },
+            timeouts: this.timeouts.getSummary()
         };
     }
     
@@ -474,12 +591,73 @@ class PipelineConfig {
         
         try {
             this._validateWorkerLimits();
-            console.log(`✅ Updated ${workerType} limit: ${oldLimit} → ${newLimit}`);
         } catch (error) {
             // Rollback on validation failure
             this.workerLimits[workerType] = oldLimit;
             throw error;
         }
+    }
+    
+    /**
+     * Get timeout value for a specific category and type
+     */
+    getTimeout(category, timeoutType) {
+        return this.timeouts.get(category, timeoutType);
+    }
+    
+    /**
+     * Update timeout value at runtime
+     */
+    updateTimeout(category, timeoutType, value) {
+        this.timeouts.set(category, timeoutType, value);
+        
+        // Update related monitoring configuration if applicable
+        if (category === 'pipeline') {
+            if (timeoutType === 'maxWait') {
+                this.monitoring.maxWaitTimeMs = value;
+            } else if (timeoutType === 'checkInterval') {
+                this.monitoring.checkIntervalMs = value;
+            }
+        }
+        
+        // Update shutdown timeouts if worker or queue timeouts changed
+        if (category === 'worker' || category === 'queue' || category === 'database') {
+            this._updateShutdownTimeouts();
+        }
+    }
+    
+    /**
+     * Update shutdown timeouts based on current timeout configuration
+     */
+    _updateShutdownTimeouts() {
+        this.monitoring.shutdownTimeouts = {
+            outboxPublisher: this.timeouts.get('worker', 'shutdown'),
+            triangulatedAnalysisQueue: this.timeouts.get('queue', 'cleanup'),
+            workers: this.timeouts.get('worker', 'shutdown'),
+            workerPoolManager: this.timeouts.get('worker', 'shutdown') + 5000, // Slightly longer for manager
+            queueManager: this.timeouts.get('queue', 'connection'),
+            neo4jDriver: this.timeouts.get('database', 'connection'),
+            databaseOperations: this.timeouts.get('database', 'shutdown')
+        };
+    }
+    
+    /**
+     * Get all timeouts for a specific category
+     */
+    getTimeoutCategory(category) {
+        return this.timeouts.getCategory(category);
+    }
+    
+    /**
+     * Reset timeouts to defaults
+     */
+    resetTimeouts() {
+        this.timeouts.resetToDefaults();
+        
+        // Update dependent configurations
+        this.monitoring.maxWaitTimeMs = this.timeouts.get('pipeline', 'maxWait');
+        this.monitoring.checkIntervalMs = this.timeouts.get('pipeline', 'checkInterval');
+        this._updateShutdownTimeouts();
     }
     
     /**

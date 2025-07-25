@@ -1,9 +1,6 @@
 const { Queue, Worker } = require('bullmq');
 const IORedis = require('ioredis');
 const config = require('../../config/index.js');
-const { QueueCleanupManager } = require('./queueCleanupManager.js');
-const { PipelineConfig } = require('../config/pipelineConfig.js');
-const { getLogger } = require('../config/logging.js');
 
 const FAILED_JOBS_QUEUE_NAME = 'failed-jobs';
 
@@ -21,83 +18,31 @@ class QueueManager {
   constructor() {
     this.workers = [];
     this.activeQueues = new Map();
-    this.connection = null;
+    this.connection = new IORedis(config.REDIS_URL);
     this.isConnected = false;
-    this.cleanupManager = null;
-    this.pipelineConfig = null;
-    
-    // Initialize logger
-    this.logger = getLogger('QueueManager');
-
-    this.connection = new IORedis(config.REDIS_URL, {
-      maxRetriesPerRequest: null,
-      enableReadyCheck: true,
-      enableOfflineQueue: true,
-      reconnectOnError: (err) => {
-        const targetError = 'READONLY';
-        if (err.message.includes(targetError)) {
-          // Only reconnect when the error contains "READONLY"
-          return true;
-        }
-        return false;
-      },
-      // Connection pool settings for high concurrency
-      connectionName: 'queue-manager',
-      lazyConnect: false,
-    });
-
-    this.connection.on('connect', () => {
-      this.isConnected = true;
-      this.logger.info('Successfully connected to Redis', {
-        url: config.REDIS_URL.replace(/:[^:@]+@/, ':***@') // Mask password in URL
-      });
-      this._initializeCleanupManager();
-    });
-
-    this.connection.on('error', (err) => {
-      this.logger.error('Redis Client Error', err);
-      this.isConnected = false;
-    });
-
-    this.connection.on('end', () => {
-      this.isConnected = false;
-      this.logger.info('Redis connection closed');
-    });
   }
 
   async connect() {
     if (this.isConnected) {
       return Promise.resolve();
     }
-    // The 'ready' event indicates the connection is established and ready for commands.
     return new Promise((resolve, reject) => {
-      this.connection.once('ready', resolve);
+      this.connection.once('ready', () => {
+        this.isConnected = true;
+        resolve();
+      });
       this.connection.once('error', reject);
-    });
-  }
-
-  createConnection(name = 'worker') {
-    // Create a new Redis connection for workers to avoid connection conflicts
-    return new IORedis(config.REDIS_URL, {
-      maxRetriesPerRequest: null,
-      enableReadyCheck: true,
-      enableOfflineQueue: true,
-      connectionName: name,
-      lazyConnect: false,
     });
   }
 
   getQueue(queueName) {
     if (!ALLOWED_QUEUES.has(queueName)) {
-        console.error(`Disallowed queue name requested: ${queueName}`);
-        return null;
+      throw new Error(`Disallowed queue name: ${queueName}. Allowed queues: ${Array.from(ALLOWED_QUEUES).join(', ')}`);
     }
 
     if (this.activeQueues.has(queueName)) {
       return this.activeQueues.get(queueName);
     }
-
-    console.log(`Creating new queue instance for: ${queueName}`);
 
     const newQueue = new Queue(queueName, {
       connection: this.connection,
@@ -116,53 +61,66 @@ class QueueManager {
     return newQueue;
   }
 
-  createWorker(queueName, processor, options = {}) {
+  async createWorker(queueName, processor, options = {}) {
+    const workerConnection = new IORedis(config.REDIS_URL);
+    
     const workerConfig = {
-      connection: this.connection,
-      stalledInterval: 30000,
-      lockDuration: 1800000,
+      connection: workerConnection,
+      concurrency: options.concurrency || 1,
       ...options,
     };
 
     const worker = new Worker(queueName, processor, workerConfig);
     this.workers.push(worker);
+    
     return worker;
   }
 
   async closeConnections() {
-    console.log('Closing all active queues, workers, and the main Redis connection...');
+    console.log('Closing all connections...');
 
-    // Stop cleanup manager first
-    if (this.cleanupManager) {
+    // Close workers
+    const workerClosePromises = this.workers.map(async (worker) => {
       try {
-        await this.cleanupManager.stop();
-        console.log('✅ Cleanup manager stopped');
+        await worker.close();
       } catch (error) {
-        console.error('❌ Error stopping cleanup manager:', error);
+        console.error('Error closing worker:', error);
+      }
+    });
+
+    // Close active queues
+    const queueClosePromises = Array.from(this.activeQueues.values()).map(async (queue) => {
+      try {
+        await queue.close();
+      } catch (error) {
+        console.error('Error closing queue:', error);
+      }
+    });
+
+    // Wait for all workers and queues to close
+    await Promise.allSettled([...workerClosePromises, ...queueClosePromises]);
+
+    // Close the primary connection
+    if (this.connection) {
+      try {
+        await this.connection.quit();
+      } catch (error) {
+        console.error('Error closing primary connection:', error);
       }
     }
 
-    const closePromises = [
-      ...Array.from(this.activeQueues.values()).map(q => q.close()),
-      ...this.workers.map(w => w.close()),
-    ];
-
-    await Promise.allSettled(closePromises);
-
-    if (this.connection) {
-      await this.connection.quit();
-    }
-
+    // Clear tracking arrays
     this.activeQueues.clear();
     this.workers = [];
-    this.cleanupManager = null;
-    console.log('All connections have been closed.');
+    this.isConnected = false;
+    
+    console.log('All connections closed.');
   }
 
   async clearAllQueues() {
-    console.log('🗑️ Clearing all Redis queues...');
+    console.log('Clearing all Redis queues...');
     const clearPromises = [];
-    // Ensure config.QUEUE_NAMES is an array before iterating
+    
     const queueNames = Array.isArray(config.QUEUE_NAMES) ? config.QUEUE_NAMES : [];
     for (const queueName of queueNames) {
       const queue = this.getQueue(queueName);
@@ -180,7 +138,7 @@ class QueueManager {
     }
 
     await Promise.allSettled(clearPromises);
-    console.log('✅ All Redis queues cleared successfully.');
+    console.log('All Redis queues cleared successfully.');
   }
 
   async getJobCounts() {
@@ -191,6 +149,7 @@ class QueueManager {
         failed: 0,
         delayed: 0,
     };
+    
     for (const queue of this.activeQueues.values()) {
         const counts = await queue.getJobCounts('active', 'waiting', 'completed', 'failed', 'delayed');
         jobCounts.active += counts.active;
@@ -199,123 +158,8 @@ class QueueManager {
         jobCounts.failed += counts.failed;
         jobCounts.delayed += counts.delayed;
     }
+    
     return jobCounts;
-  }
-
-  // ========== CLEANUP MANAGER INTEGRATION ==========
-
-  /**
-   * Initialize the cleanup manager with pipeline configuration
-   */
-  _initializeCleanupManager() {
-    try {
-      if (!this.pipelineConfig) {
-        this.pipelineConfig = new PipelineConfig();
-      }
-
-      const cleanupConfig = this.pipelineConfig.getCleanupConfig();
-      this.cleanupManager = new QueueCleanupManager(this, cleanupConfig);
-
-      // Start the cleanup manager automatically
-      this.cleanupManager.start().catch(error => {
-        this.logger.error('Failed to start cleanup manager', error);
-      });
-
-      this.logger.info('Queue cleanup manager initialized and started');
-    } catch (error) {
-      this.logger.error('Failed to initialize cleanup manager', error);
-    }
-  }
-
-  /**
-   * Get the cleanup manager instance
-   */
-  getCleanupManager() {
-    return this.cleanupManager;
-  }
-
-  /**
-   * Clean stale jobs from all queues
-   */
-  async cleanStaleJobs(queueName = null, maxAge = null) {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized');
-      return { processed: 0, cleaned: 0, errors: 1 };
-    }
-
-    return await this.cleanupManager.cleanStaleJobs(queueName, maxAge);
-  }
-
-  /**
-   * Clean failed jobs from all queues
-   */
-  async cleanFailedJobs(queueName = null, retentionCount = null) {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized');
-      return { processed: 0, cleaned: 0, errors: 1 };
-    }
-
-    return await this.cleanupManager.cleanFailedJobs(queueName, retentionCount);
-  }
-
-  /**
-   * Clean completed jobs from all queues
-   */
-  async cleanCompletedJobs(queueName = null, retentionCount = null) {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized');
-      return { processed: 0, cleaned: 0, errors: 1 };
-    }
-
-    return await this.cleanupManager.cleanCompletedJobs(queueName, retentionCount);
-  }
-
-  /**
-   * Clear stuck jobs that are blocking workers
-   */
-  async clearStuckJobs(queueName = null) {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized');
-      return { processed: 0, cleaned: 0, errors: 1 };
-    }
-
-    return await this.cleanupManager.clearStuckJobs(queueName);
-  }
-
-  /**
-   * Get queue health status
-   */
-  async getQueueHealth(queueName = null) {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized');
-      return { overall: 'unknown', error: 'Cleanup manager not available' };
-    }
-
-    return await this.cleanupManager.getQueueHealth(queueName);
-  }
-
-  /**
-   * Get cleanup metrics
-   */
-  getCleanupMetrics() {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized');
-      return { error: 'Cleanup manager not available' };
-    }
-
-    return this.cleanupManager.getMetrics();
-  }
-
-  /**
-   * Emergency cleanup - clear all queues (requires confirmation)
-   */
-  async emergencyCleanup(confirmation = false) {
-    if (!this.cleanupManager) {
-      console.warn('⚠️  Cleanup manager not initialized, falling back to basic clear');
-      return await this.clearAllQueues();
-    }
-
-    return await this.cleanupManager.clearAllQueues(confirmation);
   }
 }
 

@@ -428,27 +428,68 @@ class OptimizedRelationshipResolver {
         console.log(`💾 Saving ${relationships.length} relationships...`);
         
         try {
-            // Prepare relationships for batch insert
-            const relationshipRows = relationships.map(rel => [
-                rel.source_poi_id,
-                rel.target_poi_id,
-                rel.type,
-                rel.confidence || 0.8,
-                rel.evidence || 'deterministic',
-                rel.reason || '',
-                runId,
-                new Date().toISOString()
-            ]);
+            // Validate and prepare relationships for batch insert
+            const validatedRows = [];
+            
+            for (const rel of relationships) {
+                try {
+                    // Validate required fields
+                    if (!rel.source_poi_id || !rel.target_poi_id) {
+                        console.warn(`[OptimizedRelationshipResolver] Invalid relationship missing POI IDs, skipping:`, rel);
+                        continue;
+                    }
+                    
+                    if (!rel.type || typeof rel.type !== 'string') {
+                        console.warn(`[OptimizedRelationshipResolver] Invalid relationship missing type, skipping:`, rel);
+                        continue;
+                    }
+
+                    // Validate and provide defaults for new required fields
+                    let confidence = rel.confidence;
+                    if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) {
+                        confidence = 0.8; // Default confidence
+                        if (rel.confidence !== undefined) {
+                            console.warn(`[OptimizedRelationshipResolver] Invalid confidence ${rel.confidence} for relationship ${rel.source_poi_id} -> ${rel.target_poi_id}, using default 0.8`);
+                        }
+                    }
+
+                    let reason = rel.reason;
+                    if (!reason || typeof reason !== 'string') {
+                        reason = `${rel.type} relationship detected`; // Default reason
+                        if (rel.reason !== undefined) {
+                            console.warn(`[OptimizedRelationshipResolver] Invalid reason for relationship ${rel.source_poi_id} -> ${rel.target_poi_id}, using default`);
+                        }
+                    }
+
+                    validatedRows.push([
+                        rel.source_poi_id,
+                        rel.target_poi_id,
+                        rel.type.toUpperCase(),
+                        confidence,
+                        rel.evidence || 'deterministic',
+                        reason.trim(),
+                        runId,
+                        new Date().toISOString()
+                    ]);
+                } catch (error) {
+                    console.error(`[OptimizedRelationshipResolver] Error validating relationship:`, error, rel);
+                }
+            }
+
+            if (validatedRows.length === 0) {
+                console.warn(`[OptimizedRelationshipResolver] No valid relationships to save`);
+                return;
+            }
 
             // Use enhanced database manager's batch insert
             const inserted = this.dbManager.batchInsert(
                 'relationships',
-                ['source_poi_id', 'target_poi_id', 'type', 'confidence_score', 'evidence_type', 'reason', 'run_id', 'created_at'],
-                relationshipRows,
+                ['source_poi_id', 'target_poi_id', 'type', 'confidence', 'evidence_type', 'reason', 'run_id', 'created_at'],
+                validatedRows,
                 batchSize
             );
 
-            console.log(`✅ Saved ${inserted} relationships to database`);
+            console.log(`✅ Saved ${inserted} validated relationships to database`);
         } catch (error) {
             console.error('❌ Failed to save relationships:', error);
             throw error;

@@ -29,41 +29,10 @@ const clearNeo4j = async () => {
 const setupSqlite = async () => {
     dbManager = new DatabaseManager(TEST_DB_PATH);
     db = dbManager.getDb();
-    // Create the correct schema that matches the current implementation
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT UNIQUE NOT NULL,
-            language TEXT,
-            checksum TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS pois (
-            id TEXT PRIMARY KEY,
-            file_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            type TEXT NOT NULL,
-            description TEXT,
-            line_number INTEGER,
-            is_exported BOOLEAN DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (file_id) REFERENCES files(id)
-        );
-    `);
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS relationships (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_poi_id TEXT NOT NULL,
-            target_poi_id TEXT NOT NULL,
-            type TEXT NOT NULL,
-            reason TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (source_poi_id) REFERENCES pois(id),
-            FOREIGN KEY (target_poi_id) REFERENCES pois(id)
-        );
-    `);
+    // Use the exact schema from schema.sql to ensure compatibility
+    const schemaPath = path.join(__dirname, '../../src/utils/schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    db.exec(schema);
 };
 
 describe('GraphBuilder Agent - Functional Tests', () => {
@@ -132,30 +101,42 @@ describe('GraphBuilder Agent - Functional Tests', () => {
             const agent = new GraphBuilder(db, driver);
 
             // Insert file and POI data into SQLite using correct schema
-            const fileStmt = db.prepare('INSERT INTO files (path, language, checksum) VALUES (?, ?, ?)');
-            const fileId = fileStmt.run('test.js', 'javascript', 'abc123').lastInsertRowid;
+            const fileStmt = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
+            const fileId = fileStmt.run('test.js', 'abc123').lastInsertRowid;
             
-            const poiStmt = db.prepare('INSERT INTO pois (id, file_id, name, type, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
+            const poiStmt = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+            const poiIds = [];
             for (let i = 1; i <= 5; i++) {
-                poiStmt.run(`test-upid-${i}`, fileId, `testFunc${i}`, 'FUNCTION', 'Test function', i * 10, 1);
+                const poiId = poiStmt.run(fileId, 'test.js', `testFunc${i}`, 'FUNCTION', i * 10, i * 10 + 5, 'Test function', 1).lastInsertRowid;
+                poiIds.push(poiId);
             }
+
+            // Create some validated relationships so POIs get persisted to Neo4j
+            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, status, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)');
+            relStmt.run(poiIds[0], poiIds[1], 'CALLS', 'VALIDATED', 0.9, 'Function call');
+            relStmt.run(poiIds[2], poiIds[3], 'CALLS', 'VALIDATED', 0.9, 'Function call');
 
             await agent.run();
 
             const session = driver.session({ database: process.env.NEO4J_DATABASE || 'neo4j' });
             const result = await session.run('MATCH (p:POI) RETURN count(p) AS count');
             await session.close();
-            expect(result.records[0].get('count').low).toBe(5);
+            expect(result.records[0].get('count').low).toBe(4); // Only POIs involved in relationships
         });
 
         test('GB-R-03: should be idempotent and not create duplicate nodes on second run', async () => {
             const agent = new GraphBuilder(db, driver);
             
-            const fileStmt = db.prepare('INSERT INTO files (path, language, checksum) VALUES (?, ?, ?)');
-            const fileId = fileStmt.run('test.js', 'javascript', 'abc123').lastInsertRowid;
+            const fileStmt = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
+            const fileId = fileStmt.run('test.js', 'abc123').lastInsertRowid;
             
-            const poiStmt = db.prepare('INSERT INTO pois (id, file_id, name, type, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            poiStmt.run('test-upid-1', fileId, 'testFunc1', 'FUNCTION', 'Test function', 10, 1);
+            const poiStmt = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+            const poiId1 = poiStmt.run(fileId, 'test.js', 'testFunc1', 'FUNCTION', 10, 15, 'Test function', 1).lastInsertRowid;
+            const poiId2 = poiStmt.run(fileId, 'test.js', 'testFunc2', 'FUNCTION', 20, 25, 'Test function', 1).lastInsertRowid;
+
+            // Create a relationship so POIs get persisted to Neo4j
+            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, status, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)');
+            relStmt.run(poiId1, poiId2, 'CALLS', 'VALIDATED', 0.9, 'test relationship');
 
             await agent.run(); // First run
             await agent.run(); // Second run
@@ -163,28 +144,28 @@ describe('GraphBuilder Agent - Functional Tests', () => {
             const session = driver.session({ database: process.env.NEO4J_DATABASE || 'neo4j' });
             const result = await session.run('MATCH (p:POI) RETURN count(p) AS count');
             await session.close();
-            expect(result.records[0].get('count').low).toBe(1);
+            expect(result.records[0].get('count').low).toBe(2); // Both POIs involved in relationship
         });
 
         test('GB-R-04: should create relationships from the database', async () => {
             const agent = new GraphBuilder(db, driver);
             
             // Insert file and POIs first
-            const fileStmt = db.prepare('INSERT INTO files (path, language, checksum) VALUES (?, ?, ?)');
-            const fileId = fileStmt.run('test.js', 'javascript', 'abc123').lastInsertRowid;
+            const fileStmt = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
+            const fileId = fileStmt.run('test.js', 'abc123').lastInsertRowid;
             
-            const poiStmt = db.prepare('INSERT INTO pois (id, file_id, name, type, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            poiStmt.run('source-node', fileId, 'sourceFunc', 'FUNCTION', 'Source function', 10, 1);
-            poiStmt.run('target-node', fileId, 'targetFunc', 'FUNCTION', 'Target function', 20, 1);
+            const poiStmt = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+            const sourcePoiId = poiStmt.run(fileId, 'test.js', 'sourceFunc', 'FUNCTION', 10, 15, 'Source function', 1).lastInsertRowid;
+            const targetPoiId = poiStmt.run(fileId, 'test.js', 'targetFunc', 'FUNCTION', 20, 25, 'Target function', 1).lastInsertRowid;
 
-            // Insert relationship
-            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, reason) VALUES (?, ?, ?, ?)');
-            relStmt.run('source-node', 'target-node', 'CALLS', 'test relationship');
+            // Insert relationship with status VALIDATED for GraphBuilder to process
+            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, status, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)');
+            relStmt.run(sourcePoiId, targetPoiId, 'CALLS', 'VALIDATED', 0.9, 'test relationship');
 
             await agent.run();
 
             const session = driver.session({ database: process.env.NEO4J_DATABASE || 'neo4j' });
-            const result = await session.run("MATCH (:POI {id: 'source-node'})-[r:CALLS]->(:POI {id: 'target-node'}) RETURN count(r) AS count");
+            const result = await session.run("MATCH ()-[r:RELATIONSHIP]->() WHERE r.type = 'CALLS' RETURN count(r) AS count");
             await session.close();
             expect(result.records[0].get('count').low).toBe(1);
         });
@@ -192,21 +173,21 @@ describe('GraphBuilder Agent - Functional Tests', () => {
         test('GB-R-05: should be idempotent and not create duplicate relationships on second run', async () => {
             const agent = new GraphBuilder(db, driver);
             
-            const fileStmt = db.prepare('INSERT INTO files (path, language, checksum) VALUES (?, ?, ?)');
-            const fileId = fileStmt.run('test.js', 'javascript', 'abc123').lastInsertRowid;
+            const fileStmt = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
+            const fileId = fileStmt.run('test.js', 'abc123').lastInsertRowid;
             
-            const poiStmt = db.prepare('INSERT INTO pois (id, file_id, name, type, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            poiStmt.run('source-node', fileId, 'sourceFunc', 'FUNCTION', 'Source function', 10, 1);
-            poiStmt.run('target-node', fileId, 'targetFunc', 'FUNCTION', 'Target function', 20, 1);
+            const poiStmt = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+            const sourcePoiId = poiStmt.run(fileId, 'test.js', 'sourceFunc', 'FUNCTION', 10, 15, 'Source function', 1).lastInsertRowid;
+            const targetPoiId = poiStmt.run(fileId, 'test.js', 'targetFunc', 'FUNCTION', 20, 25, 'Target function', 1).lastInsertRowid;
             
-            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, reason) VALUES (?, ?, ?, ?)');
-            relStmt.run('source-node', 'target-node', 'CALLS', 'test relationship');
+            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, status, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)');
+            relStmt.run(sourcePoiId, targetPoiId, 'CALLS', 'VALIDATED', 0.9, 'test relationship');
 
             await agent.run(); // First run
             await agent.run(); // Second run
 
             const session = driver.session({ database: process.env.NEO4J_DATABASE || 'neo4j' });
-            const result = await session.run("MATCH ()-[r:CALLS]->() RETURN count(r) AS count");
+            const result = await session.run("MATCH ()-[r:RELATIONSHIP]->() WHERE r.type = 'CALLS' RETURN count(r) AS count");
             await session.close();
             expect(result.records[0].get('count').low).toBe(1);
         });
@@ -214,15 +195,15 @@ describe('GraphBuilder Agent - Functional Tests', () => {
         test('GB-R-06: should ignore relationships with types not in the allowlist', async () => {
             const agent = new GraphBuilder(db, driver);
             
-            const fileStmt = db.prepare('INSERT INTO files (path, language, checksum) VALUES (?, ?, ?)');
-            const fileId = fileStmt.run('test.js', 'javascript', 'abc123').lastInsertRowid;
+            const fileStmt = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
+            const fileId = fileStmt.run('test.js', 'abc123').lastInsertRowid;
             
-            const poiStmt = db.prepare('INSERT INTO pois (id, file_id, name, type, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            poiStmt.run('source-node', fileId, 'sourceFunc', 'FUNCTION', 'Source function', 10, 1);
-            poiStmt.run('target-node', fileId, 'targetFunc', 'FUNCTION', 'Target function', 20, 1);
+            const poiStmt = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+            const sourcePoiId = poiStmt.run(fileId, 'test.js', 'sourceFunc', 'FUNCTION', 10, 15, 'Source function', 1).lastInsertRowid;
+            const targetPoiId = poiStmt.run(fileId, 'test.js', 'targetFunc', 'FUNCTION', 20, 25, 'Target function', 1).lastInsertRowid;
             
-            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, reason) VALUES (?, ?, ?, ?)');
-            relStmt.run('source-node', 'target-node', 'INVALID_TYPE', 'test relationship');
+            const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, status, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)');
+            relStmt.run(sourcePoiId, targetPoiId, 'INVALID_TYPE', 'VALIDATED', 0.9, 'test relationship');
 
             await agent.run();
 
@@ -235,21 +216,24 @@ describe('GraphBuilder Agent - Functional Tests', () => {
 
     test('GB-R-01: should run the full integration from SQLite to Neo4j', async () => {
         // 1. Setup SQLite data using correct schema
-        const fileStmt = db.prepare('INSERT INTO files (path, language, checksum) VALUES (?, ?, ?)');
-        const file1Id = fileStmt.run('file1.js', 'javascript', 'abc123').lastInsertRowid;
-        const file2Id = fileStmt.run('file2.js', 'javascript', 'def456').lastInsertRowid;
+        const fileStmt = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
+        const file1Id = fileStmt.run('file1.js', 'abc123').lastInsertRowid;
+        const file2Id = fileStmt.run('file2.js', 'def456').lastInsertRowid;
         
-        const poiStmt = db.prepare('INSERT INTO pois (id, file_id, name, type, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        const poiStmt = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+        const poiIds = [];
         for (let i = 1; i <= 10; i++) {
             const fileId = i % 2 === 0 ? file2Id : file1Id;
-            poiStmt.run(`poi-${i}`, fileId, `func${i}`, 'FUNCTION', `Function ${i}`, i * 10, 1);
+            const filePath = i % 2 === 0 ? 'file2.js' : 'file1.js';
+            const poiId = poiStmt.run(fileId, filePath, `func${i}`, 'FUNCTION', i * 10, i * 10 + 5, `Function ${i}`, 1).lastInsertRowid;
+            poiIds.push(poiId);
         }
 
-        const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, reason) VALUES (?, ?, ?, ?)');
-        relStmt.run('poi-1', 'poi-2', 'CALLS', 'Function call');
-        relStmt.run('poi-3', 'poi-4', 'CALLS', 'Function call');
-        relStmt.run('poi-5', 'poi-6', 'USES', 'Uses relationship');
-        relStmt.run('poi-7', 'poi-8', 'DEPENDS_ON', 'Dependency');
+        const relStmt = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, status, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)');
+        relStmt.run(poiIds[0], poiIds[1], 'CALLS', 'VALIDATED', 0.9, 'Function call');
+        relStmt.run(poiIds[2], poiIds[3], 'CALLS', 'VALIDATED', 0.9, 'Function call');
+        relStmt.run(poiIds[4], poiIds[5], 'USES', 'VALIDATED', 0.8, 'Uses relationship');
+        relStmt.run(poiIds[6], poiIds[7], 'DEPENDS_ON', 'VALIDATED', 0.7, 'Dependency');
 
         // 2. Execute
         const agent = new GraphBuilder(db, driver);
@@ -258,10 +242,10 @@ describe('GraphBuilder Agent - Functional Tests', () => {
         // 3. Assert
         const session = driver.session({ database: process.env.NEO4J_DATABASE || 'neo4j' });
         const nodeResult = await session.run('MATCH (p:POI) RETURN count(p) AS count');
-        const relResult = await session.run('MATCH ()-[r]->() RETURN count(r) AS count');
+        const relResult = await session.run('MATCH ()-[r:RELATIONSHIP]->() RETURN count(r) AS count');
         await session.close();
 
-        expect(nodeResult.records[0].get('count').low).toBe(10);
+        expect(nodeResult.records[0].get('count').low).toBe(8); // Only POIs involved in relationships (0,1,2,3,4,5,6,7)
         expect(relResult.records[0].get('count').low).toBe(4);
     });
 });

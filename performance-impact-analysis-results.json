@@ -1,0 +1,129 @@
+{
+  "timestamp": "2025-07-25T01:39:38.872Z",
+  "validation_overhead": {
+    "100_records": {
+      "validation_time_ms": 0.6638,
+      "is_valid": true,
+      "errors_found": 0
+    },
+    "500_records": {
+      "validation_time_ms": 0.959,
+      "is_valid": true,
+      "errors_found": 0
+    },
+    "1000_records": {
+      "validation_time_ms": 2.0847,
+      "is_valid": true,
+      "errors_found": 0
+    },
+    "5000_records": {
+      "validation_time_ms": 8.1678,
+      "is_valid": true,
+      "errors_found": 0
+    },
+    "confidence_scoring": {
+      "evidence_count": 1000,
+      "processing_time_ms": 0.3827,
+      "time_per_evidence_us": 0.3827
+    }
+  },
+  "memory_usage": {
+    "initial_heap_mb": "13.37",
+    "after_query_heap_mb": "14.10",
+    "heap_increase_mb": "0.73",
+    "records_processed": 6600,
+    "memory_per_record_kb": "0.113"
+  },
+  "database_performance": {
+    "validation_orphaned_relationships": {
+      "avg_time_ms": "2.307",
+      "min_time_ms": "2.056",
+      "max_time_ms": "3.334",
+      "iterations": 10
+    },
+    "validation_invalid_confidence": {
+      "avg_time_ms": "0.828",
+      "min_time_ms": "0.763",
+      "max_time_ms": "0.932",
+      "iterations": 10
+    },
+    "validation_missing_types": {
+      "avg_time_ms": "0.465",
+      "min_time_ms": "0.418",
+      "max_time_ms": "0.788",
+      "iterations": 10
+    },
+    "complex_join_query": {
+      "avg_time_ms": "5.924",
+      "min_time_ms": "5.786",
+      "max_time_ms": "6.268",
+      "iterations": 10
+    }
+  },
+  "pipeline_throughput": {
+    "100_records": {
+      "without_validation_ms": "4.69",
+      "with_validation_ms": "1.29",
+      "overhead_percentage": "-72.54",
+      "throughput_degradation": "LOW"
+    },
+    "500_records": {
+      "without_validation_ms": "1.71",
+      "with_validation_ms": "4.56",
+      "overhead_percentage": "166.87",
+      "throughput_degradation": "HIGH"
+    },
+    "1000_records": {
+      "without_validation_ms": "3.58",
+      "with_validation_ms": "4.75",
+      "overhead_percentage": "32.89",
+      "throughput_degradation": "HIGH"
+    }
+  },
+  "bottlenecks": [
+    {
+      "type": "THROUGHPUT_DEGRADATION",
+      "location": "Pipeline processing for 500_records",
+      "impact": "HIGH",
+      "overhead_percent": "166.87",
+      "description": "Pipeline throughput degraded by more than 15%"
+    },
+    {
+      "type": "THROUGHPUT_DEGRADATION",
+      "location": "Pipeline processing for 1000_records",
+      "impact": "HIGH",
+      "overhead_percent": "32.89",
+      "description": "Pipeline throughput degraded by more than 15%"
+    }
+  ],
+  "optimizations": [
+    {
+      "type": "ASYNC_VALIDATION",
+      "priority": "HIGH",
+      "description": "Implement asynchronous validation",
+      "implementation": "Move validation to background workers",
+      "expected_improvement": "70-90% throughput recovery"
+    },
+    {
+      "type": "ASYNC_VALIDATION",
+      "priority": "HIGH",
+      "description": "Implement asynchronous validation",
+      "implementation": "Move validation to background workers",
+      "expected_improvement": "70-90% throughput recovery"
+    },
+    {
+      "type": "BATCH_VALIDATION",
+      "priority": "MEDIUM",
+      "description": "Batch validation operations",
+      "implementation": "Group validation checks into single queries",
+      "expected_improvement": "30-50% validation time reduction"
+    },
+    {
+      "type": "PARTIAL_INDEX_OPTIMIZATION",
+      "priority": "LOW",
+      "description": "Create partial indexes for hot paths",
+      "implementation": "Add WHERE clauses to indexes for validated relationships",
+      "expected_improvement": "20-30% query time improvement"
+    }
+  ]
+}

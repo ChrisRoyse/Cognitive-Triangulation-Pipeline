@@ -13,21 +13,55 @@ function createDb() {
 
 function seedData(db, { files, pois, relationships }) {
     if (files) {
-        const insert = db.prepare('INSERT INTO files (id, file_path, checksum, language) VALUES (?, ?, ?, ?)');
+        // Map file IDs for relationship tests that expect custom IDs
+        const fileIdMap = new Map();
+        
+        const insert = db.prepare('INSERT INTO files (file_path, hash) VALUES (?, ?)');
         db.transaction(() => {
-            files.forEach(f => insert.run(f.id, f.file_path, f.checksum, f.language));
+            files.forEach(f => {
+                // Support both 'file_path' and 'path' for backward compatibility with existing tests
+                const filePath = f.file_path || f.path;
+                if (!filePath) {
+                    throw new Error('File must have either file_path or path property');
+                }
+                // Support both 'hash' and 'checksum' for backward compatibility
+                const hash = f.hash || f.checksum || 'default_hash';
+                const result = insert.run(filePath, hash);
+                if (f.id) {
+                    fileIdMap.set(f.id, result.lastInsertRowid);
+                }
+            });
         })();
+        
+        // Store file ID mapping for POI insertion
+        files._fileIdMap = fileIdMap;
     }
     if (pois) {
-        const insert = db.prepare('INSERT INTO pois (id, file_id, type, name, description, line_number, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        // Use file ID mapping if available
+        const fileIdMap = files?._fileIdMap || new Map();
+        
+        const insert = db.prepare('INSERT INTO pois (file_id, file_path, name, type, start_line, end_line, description, is_exported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
         db.transaction(() => {
-            pois.forEach(p => insert.run(p.id, p.file_id, p.type, p.name, p.description, p.line_number, p.is_exported ? 1 : 0));
+            pois.forEach(p => {
+                const actualFileId = fileIdMap.get(p.file_id) || p.file_id;
+                const filePath = p.file_path || 'default_file.js';
+                insert.run(
+                    actualFileId, 
+                    filePath,
+                    p.name, 
+                    p.type, 
+                    p.start_line || 1, 
+                    p.end_line || p.start_line || 1, 
+                    p.description || 'Default description', 
+                    p.is_exported ? 1 : 0
+                );
+            });
         })();
     }
     if (relationships) {
-        const insert = db.prepare('INSERT INTO relationships (id, source_poi_id, target_poi_id, type, reason) VALUES (?, ?, ?, ?, ?)');
+        const insert = db.prepare('INSERT INTO relationships (source_poi_id, target_poi_id, type, confidence, reason) VALUES (?, ?, ?, ?, ?)');
         db.transaction(() => {
-            relationships.forEach(r => insert.run(uuidv4(), r.source_poi_id, r.target_poi_id, r.type, r.reason));
+            relationships.forEach(r => insert.run(r.source_poi_id, r.target_poi_id, r.type, r.confidence || 0.8, r.reason));
         })();
     }
 }

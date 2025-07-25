@@ -1,28 +1,26 @@
 const https = require('https');
 require('dotenv').config();
 const config = require('../config');
-const { getCacheManager } = require('./cacheManager');
 const { getLogger } = require('../config/logging');
 
 /**
  * Pure DeepSeek LLM Client
  * Native implementation using HTTPS requests to DeepSeek API
- * No OpenAI SDK dependencies
+ * No OpenAI SDK dependencies - fully dynamic, no caching
  */
 class DeepSeekClient {
     constructor() {
         this.baseURL = 'https://api.deepseek.com';
-        this.timeout = 1800000; // 30 minutes timeout for very complex analysis
+        this.timeout = 150000; // 2.5 minute timeout - matching worker LLM call timeouts
         this.agent = new https.Agent({ keepAlive: false, maxSockets: 100 });
         this.maxConcurrentRequests = 4; // Global limit for concurrent requests
         this.activeRequests = 0;
         this.requestQueue = [];
         
         this._apiKey = null;
-        this.cacheManager = getCacheManager();
         this.logger = getLogger('DeepSeekClient');
         
-        this.logger.info('DeepSeekClient initialized with caching support', {
+        this.logger.info('DeepSeekClient initialized for dynamic analysis (no caching)', {
             baseURL: this.baseURL,
             timeout: this.timeout,
             maxConcurrentRequests: this.maxConcurrentRequests
@@ -40,7 +38,7 @@ class DeepSeekClient {
         return this._apiKey;
     }
 
-    async call(prompt, cacheOptions = {}) {
+    async call(prompt, options = {}) {
         const requestBody = JSON.stringify({
             model: 'deepseek-chat',
             messages: [
@@ -53,27 +51,9 @@ class DeepSeekClient {
             response_format: { type: 'json_object' }
         });
 
-        // Create cache key from prompt content
-        const promptContent = `${prompt.system}\n${prompt.user}`;
-        const options = {
-            model: 'deepseek-chat',
-            temperature: 0.0,
-            max_tokens: 8000,
-            ...cacheOptions
-        };
-
         try {
-            // Check cache first
-            const cachedResponse = await this.cacheManager.get(promptContent, options);
-            if (cachedResponse) {
-                this.logger.info('Cache hit - returning cached response', {
-                    promptPreview: promptContent.substring(0, 50) + '...'
-                });
-                return cachedResponse;
-            }
-
-            // Cache miss - make API call
-            this.logger.debug('Cache miss - making API call');
+            // Always make fresh API call for dynamic analysis
+            this.logger.debug('Making fresh API call for dynamic analysis');
             const response = await this._scheduleRequest('/chat/completions', 'POST', requestBody);
             
             const result = {
@@ -81,9 +61,6 @@ class DeepSeekClient {
                 usage: response.usage,
                 cached: false
             };
-
-            // Store in cache
-            await this.cacheManager.set(promptContent, result, options);
             
             return result;
         } catch (error) {
@@ -92,16 +69,16 @@ class DeepSeekClient {
         }
     }
 
-    async query(promptString, cacheOptions = {}) {
+    async query(promptString, options = {}) {
         const prompt = {
             system: 'You are an expert software engineer specializing in code analysis.',
             user: promptString
         };
-        const response = await this.call(prompt, cacheOptions);
+        const response = await this.call(prompt, options);
         return response.body;
     }
 
-    async createChatCompletion(options, cacheOptions = {}) {
+    async createChatCompletion(options, extraOptions = {}) {
         const requestBody = JSON.stringify({
             model: options.model || 'deepseek-chat',
             messages: options.messages,
@@ -111,29 +88,10 @@ class DeepSeekClient {
             stream: false
         });
 
-        // Create cache key from messages content
-        const promptContent = options.messages.map(m => `${m.role}: ${m.content}`).join('\n');
-        const cacheOpts = {
-            model: options.model || 'deepseek-chat',
-            temperature: options.temperature || 0.0,
-            max_tokens: options.max_tokens || 8000,
-            ...cacheOptions
-        };
-
         try {
-            // Check cache first
-            const cachedResponse = await this.cacheManager.get(promptContent, cacheOpts);
-            if (cachedResponse) {
-                this.logger.info('createChatCompletion cache hit');
-                return cachedResponse;
-            }
-
-            // Cache miss - make API call
-            this.logger.debug('createChatCompletion cache miss - making API call');
+            // Always make fresh API call for dynamic analysis
+            this.logger.debug('createChatCompletion making fresh API call');
             const response = await this._scheduleRequest('/chat/completions', 'POST', requestBody);
-
-            // Store in cache
-            await this.cacheManager.set(promptContent, response, cacheOpts);
 
             return response;
         } catch (error) {
@@ -273,51 +231,6 @@ class DeepSeekClient {
         }
     }
 
-    /**
-     * Get cache statistics
-     * @returns {object} - Cache statistics
-     */
-    getCacheStats() {
-        return this.cacheManager.getStats();
-    }
-
-    /**
-     * Clear cache entries
-     * @param {string} pattern - Optional pattern to match
-     * @returns {Promise<number>} - Number of entries cleared
-     */
-    async clearCache(pattern = null) {
-        if (pattern) {
-            return await this.cacheManager.invalidate(pattern);
-        }
-        return await this.cacheManager.clearAll();
-    }
-
-    /**
-     * Invalidate cache for specific file
-     * @param {string} filePath - File path to invalidate
-     * @returns {Promise<number>} - Number of entries invalidated
-     */
-    async invalidateFileCache(filePath) {
-        return await this.cacheManager.invalidateFile(filePath);
-    }
-
-    /**
-     * Warm cache with common patterns
-     * @param {Array} patterns - Patterns to warm
-     * @returns {Promise<void>}
-     */
-    async warmCache(patterns) {
-        return await this.cacheManager.warmCache(patterns);
-    }
-
-    /**
-     * Check cache health
-     * @returns {Promise<object>} - Health status
-     */
-    async cacheHealthCheck() {
-        return await this.cacheManager.healthCheck();
-    }
 }
 
 let clientInstance;

@@ -1,214 +1,43 @@
 /**
- * Worker Pool Manager - Intelligent Concurrency Control System
- * 
- * Features:
- * - Adaptive concurrency based on system resources
- * - Rate limiting for API calls per worker type
- * - Circuit breaker integration for fault tolerance
- * - Worker prioritization and load balancing
- * - Health monitoring and metrics collection
- * - Resource-aware scaling
+ * Simple Worker Pool Manager
+ * Manages basic worker concurrency without complex monitoring or scaling
  */
 
-const os = require('os');
 const { EventEmitter } = require('events');
-const { registry } = require('./circuitBreaker');
 
 class WorkerPoolManager extends EventEmitter {
     constructor(options = {}) {
         super();
         
-        // Set environment first
-        const environment = options.environment || process.env.NODE_ENV || 'development';
-        
-        // HARD LIMIT: Support high concurrency when forced
-        const forcedConcurrency = parseInt(process.env.FORCE_MAX_CONCURRENCY);
-        const ABSOLUTE_MAX_CONCURRENCY = forcedConcurrency > 0 ? forcedConcurrency * 5 : 100; // Allow 5x forced concurrency for all worker types
-        
-        // Get high performance mode flag early
-        const highPerformanceMode = process.env.HIGH_PERFORMANCE_MODE === 'true';
-        
-        // Configuration
+        // Simple configuration
         this.config = {
-            // Environment-specific settings (set first)
-            environment,
-            
-            // Global concurrency limits - HARD CAPPED at 150
-            maxGlobalConcurrency: Math.min(
-                options.maxGlobalConcurrency || this.calculateMaxConcurrency(environment),
-                ABSOLUTE_MAX_CONCURRENCY
-            ),
-            minWorkerConcurrency: options.minWorkerConcurrency || 1,
-            maxWorkerConcurrency: options.maxWorkerConcurrency || 50, // Max per worker type within 100 total
-            
-            // Resource monitoring
-            cpuThreshold: options.cpuThreshold || parseInt(process.env.CPU_THRESHOLD) || 80, // CPU % threshold
-            memoryThreshold: options.memoryThreshold || parseInt(process.env.MEMORY_THRESHOLD) || 85, // Memory % threshold
-            
-            // High performance mode
-            highPerformanceMode: highPerformanceMode,
-            disableResourceScaling: process.env.DISABLE_RESOURCE_SCALING === 'true',
-            
-            // Adaptive scaling
-            scaleUpFactor: options.scaleUpFactor || 1.5,
-            scaleDownFactor: options.scaleDownFactor || 0.7,
-            adaptiveInterval: options.adaptiveInterval || 30000, // 30 seconds
-            
-            // Rate limiting (per worker type) - More permissive for better throughput
-            rateLimits: {
-                default: { requests: highPerformanceMode ? 100 : 15, window: 1000 }, // Much higher in high perf mode
-                'file-analysis': { requests: highPerformanceMode ? 100 : 12, window: 1000 }, // High for parallel processing
-                'llm-analysis': { requests: highPerformanceMode ? 50 : 8, window: 1000 }, // Still respect API limits
-                'validation': { requests: highPerformanceMode ? 200 : 20, window: 1000 }, // Can handle more
-                'graph-ingestion': { requests: highPerformanceMode ? 100 : 15, window: 1000 },
-                'relationship-resolution': { requests: highPerformanceMode ? 80 : 10, window: 1000 },
-                'directory-aggregation': { requests: highPerformanceMode ? 150 : 20, window: 1000 },
-                ...options.rateLimits
-            },
-            
-            // Worker priorities (higher = more important)
-            workerPriorities: {
-                'file-analysis': 10,
-                'validation': 9,
-                'graph-ingestion': 8,
-                'directory-aggregation': 7,
-                'relationship-resolution': 6,
-                'global-resolution': 5,
-                ...options.workerPriorities
-            }
+            maxConcurrency: options.maxConcurrency || 100,
+            minWorkerConcurrency: 1,
+            maxWorkerConcurrency: 50
         };
         
-        // State management
-        this.workers = new Map(); // worker type -> worker info
+        // Simple state tracking
+        this.workers = new Map(); // worker type -> { concurrency, activeJobs }
         this.currentConcurrency = 0;
-        this.rateLimiters = new Map(); // worker type -> rate limiter
-        this.metrics = {
-            startTime: Date.now(),
-            totalRequests: 0,
-            activeRequests: 0,
-            completedRequests: 0,
-            failedRequests: 0,
-            throttledRequests: 0,
-            resourceScalings: 0,
-            lastResourceCheck: Date.now()
-        };
         
-        // Integration points
-        this.globalConcurrencyManager = null;
-        this.circuitBreakerManager = null;
-        
-        // Resource monitoring
-        this.resourceMonitor = null;
-        this.lastCpuUsage = process.cpuUsage();
-        this.lastMemoryUsage = process.memoryUsage();
-        
-        // Initialize subsystems
-        this.initializeRateLimiters();
-        this.startResourceMonitoring();
-        this.startAdaptiveScaling();
-        
-        console.log(`🎯 WorkerPoolManager initialized (max global concurrency: ${this.config.maxGlobalConcurrency})`);
-        this.logConfiguration();
-    }
-
-    /**
-     * Calculate maximum concurrency based on system resources
-     */
-    calculateMaxConcurrency(environment) {
-        // HARD LIMIT: Never exceed 150
-        const ABSOLUTE_MAX = 150;
-        
-        // Check for forced override first
-        const forcedConcurrency = process.env.FORCE_MAX_CONCURRENCY;
-        if (forcedConcurrency) {
-            const forced = parseInt(forcedConcurrency);
-            if (!isNaN(forced) && forced > 0) {
-                const capped = Math.min(forced, ABSOLUTE_MAX);
-                if (forced > ABSOLUTE_MAX) {
-                    console.warn(`⚠️  Requested concurrency ${forced} exceeds hard limit of ${ABSOLUTE_MAX}. Using ${ABSOLUTE_MAX}.`);
-                }
-                console.log(`🎯 Using forced max global concurrency: ${capped} (from FORCE_MAX_CONCURRENCY)`);
-                return capped;
-            }
-        }
-        
-        const cpuCount = os.cpus().length;
-        const totalMemoryGB = os.totalmem() / (1024 * 1024 * 1024);
-        
-        // More generous base calculation: 3x CPU cores + memory factor
-        let maxConcurrency = Math.floor(cpuCount * 3 + totalMemoryGB / 1.5);
-        
-        // Environment adjustments - more generous across the board
-        switch (environment) {
-            case 'production':
-                maxConcurrency = Math.floor(maxConcurrency * 0.9); // Less conservative
-                break;
-            case 'development':
-                maxConcurrency = Math.floor(maxConcurrency * 1.5); // More aggressive
-                break;
-            case 'test':
-                maxConcurrency = Math.min(maxConcurrency, 20); // Higher limit for testing
-                break;
-        }
-        
-        // Higher minimums to prevent blocking
-        const minimum = environment === 'test' ? 10 : 15;
-        const result = Math.min(Math.max(maxConcurrency, minimum), ABSOLUTE_MAX);
-        
-        console.log(`🎯 Calculated max global concurrency: ${result} (CPU: ${cpuCount}, Memory: ${totalMemoryGB.toFixed(1)}GB, Environment: ${environment})`);
-        return result;
+        console.log(`⚙️ WorkerPoolManager initialized with max concurrency: ${this.config.maxConcurrency}`);
     }
 
     /**
      * Register a worker with the pool manager
      */
     registerWorker(workerType, options = {}) {
-        const priority = this.config.workerPriorities[workerType] || 5;
-        
-        // Check for forced concurrency override
-        let initialConcurrency;
-        const forcedConcurrency = process.env.FORCE_MAX_CONCURRENCY;
-        if (forcedConcurrency && parseInt(forcedConcurrency) > 0) {
-            // When using forced concurrency, respect the worker limits from PipelineConfig
-            // which distributes the total across worker types
-            initialConcurrency = options.maxConcurrency || this.calculateInitialConcurrency(workerType, priority);
-            console.log(`🎯 Worker '${workerType}' concurrency: ${initialConcurrency}`);
-        } else {
-            initialConcurrency = this.calculateInitialConcurrency(workerType, priority);
-        }
-        
         const workerInfo = {
             type: workerType,
-            priority,
-            concurrency: initialConcurrency,
+            concurrency: options.concurrency || 5,
             maxConcurrency: options.maxConcurrency || this.config.maxWorkerConcurrency,
-            minConcurrency: options.minConcurrency || this.config.minWorkerConcurrency,
-            activeJobs: 0,
-            completedJobs: 0,
-            failedJobs: 0,
-            lastActivity: Date.now(),
-            circuitBreaker: registry.get(`worker-${workerType}`, {
-                failureThreshold: options.failureThreshold || 5,
-                resetTimeout: options.resetTimeout || 60000,
-                onStateChange: (oldState, newState) => {
-                    this.handleCircuitBreakerStateChange(workerType, oldState, newState);
-                }
-            }),
-            rateLimiter: this.rateLimiters.get(workerType),
-            metrics: {
-                avgProcessingTime: 0,
-                throughput: 0,
-                errorRate: 0,
-                lastCalculated: Date.now()
-            }
+            activeJobs: 0
         };
         
         this.workers.set(workerType, workerInfo);
         this.updateCurrentConcurrency();
         
-        console.log(`📝 Registered worker '${workerType}' (concurrency: ${initialConcurrency}, priority: ${priority})`);
-        this.emit('workerRegistered', workerInfo);
-        
+        console.log(`✅ Registered worker: ${workerType} (concurrency: ${workerInfo.concurrency})`);
         return workerInfo;
     }
 
@@ -217,12 +46,7 @@ class WorkerPoolManager extends EventEmitter {
      */
     getWorkerConcurrency(workerType) {
         const worker = this.workers.get(workerType);
-        if (!worker) {
-            console.warn(`⚠️  Unknown worker type: ${workerType}`);
-            return this.config.minWorkerConcurrency;
-        }
-        
-        return worker.concurrency;
+        return worker ? worker.concurrency : this.config.minWorkerConcurrency;
     }
 
     /**
@@ -234,121 +58,40 @@ class WorkerPoolManager extends EventEmitter {
             throw new Error(`Worker type '${workerType}' not registered`);
         }
         
-        // Use global concurrency manager if available
-        if (this.globalConcurrencyManager) {
-            // Global manager handles all concurrency limits
-            const permit = await this.globalConcurrencyManager.acquire(workerType, {
-                timeout: jobData.timeout || 30000
-            });
-            
-            // Store permit for tracking
-            worker.globalPermit = permit;
-            worker.activeJobs++;
-            this.currentConcurrency++;
-            this.metrics.activeRequests++;
-            this.metrics.totalRequests++;
-            worker.lastActivity = Date.now();
-            
-            return {
-                workerType,
-                slotId: permit.id,
-                concurrency: worker.concurrency,
-                priority: worker.priority,
-                globalPermit: permit
-            };
+        // Check global concurrency limit
+        if (this.currentConcurrency >= this.config.maxConcurrency) {
+            throw new Error('Maximum concurrency limit reached');
         }
         
-        // Fallback to local management
-        // HARD CHECK: Never exceed 150 concurrent agents
-        if (this.currentConcurrency >= 150) {
-            this.metrics.throttledRequests++;
-            console.error(`🚫 HARD LIMIT: Cannot exceed 150 concurrent agents. Current: ${this.currentConcurrency}`);
-            throw new Error('Maximum concurrent agent limit (150) reached');
-        }
-        
-        // Check global concurrency limit with buffer
-        if (this.currentConcurrency >= this.config.maxGlobalConcurrency) {
-            this.metrics.throttledRequests++;
-            console.warn(`⚠️  Global concurrency limit reached: ${this.currentConcurrency}/${this.config.maxGlobalConcurrency}`);
-            throw new Error('Global concurrency limit reached');
-        }
-        
-        // Check worker-specific concurrency with logging for debugging
+        // Check worker-specific concurrency
         if (worker.activeJobs >= worker.concurrency) {
-            this.metrics.throttledRequests++;
-            console.warn(`⚠️  Worker '${workerType}' concurrency limit reached: ${worker.activeJobs}/${worker.concurrency}`);
-            throw new Error(`Worker '${workerType}' concurrency limit reached: ${worker.activeJobs}/${worker.concurrency}`);
-        }
-        
-        // Check rate limiting with more permissive logic
-        if (!this.checkRateLimit(workerType)) {
-            this.metrics.throttledRequests++;
-            console.warn(`⚠️  Rate limit exceeded for worker '${workerType}'`);
-            // Don't throw immediately, allow a small buffer for burst requests
-            await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
-            
-            // Try again after brief delay
-            if (!this.checkRateLimit(workerType)) {
-                throw new Error(`Rate limit exceeded for worker '${workerType}'`);
-            }
-        }
-        
-        // Check circuit breaker
-        if (worker.circuitBreaker.state === 'OPEN') {
-            this.metrics.throttledRequests++;
-            throw new Error(`Circuit breaker open for worker '${workerType}'`);
+            throw new Error(`Worker '${workerType}' concurrency limit reached`);
         }
         
         // Allocate slot
         worker.activeJobs++;
         this.currentConcurrency++;
-        this.metrics.activeRequests++;
-        this.metrics.totalRequests++;
-        worker.lastActivity = Date.now();
         
         return {
             workerType,
             slotId: `${workerType}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-            concurrency: worker.concurrency,
-            priority: worker.priority
+            concurrency: worker.concurrency
         };
     }
 
     /**
      * Release a job slot
      */
-    async releaseJobSlot(workerType, success = true, processingTime = 0, slotInfo = {}) {
+    async releaseJobSlot(workerType, success = true) {
         const worker = this.workers.get(workerType);
         if (!worker) {
-            console.warn(`⚠️  Attempted to release slot for unknown worker: ${workerType}`);
+            console.warn(`⚠️ Attempted to release slot for unknown worker: ${workerType}`);
             return;
-        }
-        
-        // Release global permit if using global manager
-        if (this.globalConcurrencyManager && slotInfo.globalPermit) {
-            await this.globalConcurrencyManager.release(slotInfo.globalPermit.id);
-        } else if (worker.globalPermit) {
-            // Fallback if permit stored on worker
-            await this.globalConcurrencyManager.release(worker.globalPermit.id);
-            worker.globalPermit = null;
         }
         
         // Update counters
         worker.activeJobs = Math.max(0, worker.activeJobs - 1);
         this.currentConcurrency = Math.max(0, this.currentConcurrency - 1);
-        this.metrics.activeRequests = Math.max(0, this.metrics.activeRequests - 1);
-        
-        if (success) {
-            worker.completedJobs++;
-            this.metrics.completedRequests++;
-        } else {
-            worker.failedJobs++;
-            this.metrics.failedRequests++;
-        }
-        
-        // Update metrics
-        this.updateWorkerMetrics(worker, processingTime, success);
-        worker.lastActivity = Date.now();
     }
 
     /**
@@ -356,137 +99,27 @@ class WorkerPoolManager extends EventEmitter {
      */
     async executeWithManagement(workerType, operation, jobData = {}) {
         let slot = null;
-        const startTime = Date.now();
         
         try {
             // Request slot
             slot = await this.requestJobSlot(workerType, jobData);
             
-            // Execute with circuit breaker protection if available
-            const worker = this.workers.get(workerType);
-            let result;
-            
-            if (this.circuitBreakerManager) {
-                // Use circuit breaker manager
-                result = await this.circuitBreakerManager.executeWithBreaker(
-                    workerType,
-                    operation,
-                    jobData
-                );
-            } else if (worker.circuitBreaker) {
-                // Use worker's circuit breaker
-                result = await worker.circuitBreaker.execute(operation);
-            } else {
-                // Direct execution
-                result = await operation();
-            }
+            // Execute operation
+            const result = await operation();
             
             // Success
-            const processingTime = Date.now() - startTime;
-            await this.releaseJobSlot(workerType, true, processingTime, slot);
+            await this.releaseJobSlot(workerType, true);
             
             return result;
             
         } catch (error) {
             // Failure
-            const processingTime = Date.now() - startTime;
             if (slot) {
-                await this.releaseJobSlot(workerType, false, processingTime, slot);
+                await this.releaseJobSlot(workerType, false);
             }
             
             throw error;
         }
-    }
-
-    /**
-     * Initialize rate limiters for all worker types
-     */
-    initializeRateLimiters() {
-        for (const [workerType, limits] of Object.entries(this.config.rateLimits)) {
-            this.rateLimiters.set(workerType, this.createRateLimiter(limits));
-        }
-        
-        console.log(`⏱️  Initialized ${this.rateLimiters.size} rate limiters`);
-    }
-
-    /**
-     * Create a token bucket rate limiter with burst capacity
-     */
-    createRateLimiter(config) {
-        return {
-            tokens: config.requests,
-            maxTokens: config.requests,
-            burstCapacity: Math.ceil(config.requests * 1.5), // Allow 50% burst
-            refillRate: config.requests / (config.window / 1000),
-            lastRefill: Date.now(),
-            
-            consume() {
-                this.refill();
-                if (this.tokens >= 1) {
-                    this.tokens--;
-                    return true;
-                }
-                // Allow burst if we haven't consumed too much recently
-                if (this.tokens >= 0.5) { // Allow partial token consumption for burst
-                    this.tokens -= 0.5;
-                    return true;
-                }
-                return false;
-            },
-            
-            refill() {
-                const now = Date.now();
-                const timePassed = (now - this.lastRefill) / 1000;
-                const tokensToAdd = timePassed * this.refillRate;
-                
-                // Allow burst capacity but cap at burst limit
-                this.tokens = Math.min(this.burstCapacity, this.tokens + tokensToAdd);
-                this.lastRefill = now;
-            },
-            
-            getAvailableTokens() {
-                this.refill();
-                return this.tokens;
-            }
-        };
-    }
-
-    /**
-     * Check rate limiting for a worker type
-     */
-    checkRateLimit(workerType) {
-        const rateLimiter = this.rateLimiters.get(workerType) || this.rateLimiters.get('default');
-        return rateLimiter ? rateLimiter.consume() : true;
-    }
-
-    /**
-     * Calculate initial concurrency for a worker
-     */
-    calculateInitialConcurrency(workerType, priority) {
-        const baselineMap = {
-            'file-analysis': 8,    // Increased baseline for file analysis
-            'llm-analysis': 5,     // More reasonable for LLM calls
-            'validation': 10,      // Can handle more
-            'graph-ingestion': 8,
-            'directory-aggregation': 6,
-            'relationship-resolution': 6,
-            'global-resolution': 5
-        };
-        
-        const baseline = baselineMap[workerType] || 8; // Increased default
-        
-        // More aggressive concurrency calculation
-        const priorityMultiplier = Math.max(0.8, priority / 10); // Higher minimum
-        const resourceMultiplier = Math.min(2.0, this.config.maxGlobalConcurrency / 15); // More aggressive
-        
-        const calculated = Math.floor(baseline * priorityMultiplier * resourceMultiplier);
-        const result = Math.max(
-            this.config.minWorkerConcurrency,
-            Math.min(calculated, this.config.maxWorkerConcurrency)
-        );
-        
-        console.log(`🔧 [${workerType}] Calculated initial concurrency: ${result} (baseline: ${baseline}, priority: ${priority}, multipliers: ${priorityMultiplier.toFixed(2)}x${resourceMultiplier.toFixed(2)})`);
-        return result;
     }
 
     /**
@@ -498,278 +131,46 @@ class WorkerPoolManager extends EventEmitter {
     }
 
     /**
-     * Start resource monitoring
+     * Scale workers (simple version)
      */
-    startResourceMonitoring() {
-        this.resourceMonitor = setInterval(() => {
-            this.checkSystemResources();
-        }, 10000); // Check every 10 seconds
-        
-        console.log('📊 Resource monitoring started');
-    }
+    async scaleWorkers(workerType, targetCount) {
+        const worker = this.workers.get(workerType);
+        if (!worker) {
+            throw new Error(`Worker type '${workerType}' not registered`);
+        }
 
-    /**
-     * Check system resources and trigger scaling if needed
-     */
-    checkSystemResources() {
-        try {
-            const cpuUsage = this.getCpuUsage();
-            const memoryUsage = this.getMemoryUsage();
-            
-            this.metrics.lastResourceCheck = Date.now();
-            
-            // Log resource usage periodically
-            if (Date.now() % 60000 < 10000) { // Every minute
-                console.log(`📊 Resources - CPU: ${cpuUsage.toFixed(1)}%, Memory: ${memoryUsage.toFixed(1)}%`);
-            }
-            
-            // Check for resource pressure
-            const resourcePressure = this.calculateResourcePressure(cpuUsage, memoryUsage);
-            
-            if (resourcePressure > 0.8) {
-                this.handleHighResourceUsage(cpuUsage, memoryUsage);
-            } else if (resourcePressure < 0.3) {
-                this.handleLowResourceUsage(cpuUsage, memoryUsage);
-            }
-            
-            this.emit('resourceCheck', { cpuUsage, memoryUsage, resourcePressure });
-            
-        } catch (error) {
-            console.error('❌ Error checking system resources:', error);
-        }
-    }
-
-    /**
-     * Get current CPU usage percentage
-     */
-    getCpuUsage() {
-        const currentCpuUsage = process.cpuUsage();
-        const userDiff = currentCpuUsage.user - this.lastCpuUsage.user;
-        const systemDiff = currentCpuUsage.system - this.lastCpuUsage.system;
-        const totalDiff = userDiff + systemDiff;
-        
-        this.lastCpuUsage = currentCpuUsage;
-        
-        // Convert to percentage (rough approximation)
-        return Math.min(100, (totalDiff / 1000000) * os.cpus().length);
-    }
-
-    /**
-     * Get current memory usage percentage
-     */
-    getMemoryUsage() {
-        const memoryUsage = process.memoryUsage();
-        const totalMemory = os.totalmem();
-        
-        return (memoryUsage.rss / totalMemory) * 100;
-    }
-
-    /**
-     * Calculate overall resource pressure (0-1 scale)
-     */
-    calculateResourcePressure(cpuUsage, memoryUsage) {
-        const cpuPressure = cpuUsage / 100;
-        const memoryPressure = memoryUsage / 100;
-        
-        // Weighted average (CPU weighted higher)
-        return (cpuPressure * 0.7) + (memoryPressure * 0.3);
-    }
-
-    /**
-     * Handle high resource usage by scaling down
-     */
-    handleHighResourceUsage(cpuUsage, memoryUsage) {
-        // Skip scaling down if disabled or in high performance mode
-        if (this.config.disableResourceScaling || this.config.highPerformanceMode) {
-            console.log(`⚠️  High resource usage detected (CPU: ${cpuUsage.toFixed(1)}%, Memory: ${memoryUsage.toFixed(1)}%) but scaling is disabled`);
-            return;
-        }
-        
-        console.warn(`⚠️  High resource usage detected - CPU: ${cpuUsage.toFixed(1)}%, Memory: ${memoryUsage.toFixed(1)}%`);
-        
-        // Scale down concurrency for all workers
-        for (const worker of this.workers.values()) {
-            const newConcurrency = Math.max(
-                worker.minConcurrency,
-                Math.floor(worker.concurrency * this.config.scaleDownFactor)
-            );
-            
-            if (newConcurrency < worker.concurrency) {
-                worker.concurrency = newConcurrency;
-                console.log(`📉 Scaled down '${worker.type}' concurrency to ${newConcurrency}`);
-            }
-        }
-        
-        this.metrics.resourceScalings++;
-        this.emit('resourceScaling', { direction: 'down', cpuUsage, memoryUsage });
-    }
-
-    /**
-     * Handle low resource usage by scaling up
-     */
-    handleLowResourceUsage(cpuUsage, memoryUsage) {
-        // HARD CHECK: Never scale beyond 150 agents
-        if (this.currentConcurrency >= 150 * 0.9) { // 135 agents
-            console.log(`🚫 Near hard limit of 150 agents. Not scaling up.`);
-            return;
-        }
-        
-        if (this.currentConcurrency >= this.config.maxGlobalConcurrency * 0.8) {
-            return; // Don't scale up if we're near global limit
-        }
-        
-        // Scale up high-priority workers first
-        const sortedWorkers = Array.from(this.workers.values())
-            .sort((a, b) => b.priority - a.priority);
-        
-        for (const worker of sortedWorkers) {
-            // HARD CHECK: Stop scaling if approaching 150 limit
-            if (this.currentConcurrency >= 135) { // 90% of 150
-                console.log(`🚫 Stopping scale up - approaching hard limit of 150 agents`);
-                break;
-            }
-            
-            if (this.currentConcurrency >= this.config.maxGlobalConcurrency * 0.8) {
-                break;
-            }
-            
-            const newConcurrency = Math.min(
-                worker.maxConcurrency,
-                Math.floor(worker.concurrency * this.config.scaleUpFactor)
-            );
-            
-            if (newConcurrency > worker.concurrency) {
-                worker.concurrency = newConcurrency;
-                console.log(`📈 Scaled up '${worker.type}' concurrency to ${newConcurrency}`);
-            }
-        }
-        
-        this.updateCurrentConcurrency();
-        this.metrics.resourceScalings++;
-        this.emit('resourceScaling', { direction: 'up', cpuUsage, memoryUsage });
-    }
-
-    /**
-     * Start adaptive scaling based on worker performance
-     */
-    startAdaptiveScaling() {
-        setInterval(() => {
-            this.performAdaptiveScaling();
-        }, this.config.adaptiveInterval);
-        
-        console.log(`🔄 Adaptive scaling started (interval: ${this.config.adaptiveInterval}ms)`);
-    }
-
-    /**
-     * Perform adaptive scaling based on worker metrics
-     */
-    performAdaptiveScaling() {
-        for (const worker of this.workers.values()) {
-            this.updateWorkerMetrics(worker);
-            
-            const shouldScale = this.shouldScaleWorker(worker);
-            if (shouldScale.scale) {
-                this.scaleWorker(worker, shouldScale.direction, shouldScale.reason);
-            }
-        }
-    }
-
-    /**
-     * Update worker performance metrics
-     */
-    updateWorkerMetrics(worker, processingTime = null, success = true) {
-        const now = Date.now();
-        const timeDiff = now - worker.metrics.lastCalculated;
-        
-        if (timeDiff < 5000) return; // Don't update too frequently
-        
-        // Calculate throughput (jobs per second)
-        const totalJobs = worker.completedJobs + worker.failedJobs;
-        const timeWindow = (now - (worker.metrics.lastCalculated || now - 60000)) / 1000;
-        worker.metrics.throughput = totalJobs / Math.max(timeWindow, 1);
-        
-        // Calculate error rate
-        worker.metrics.errorRate = totalJobs > 0 ? (worker.failedJobs / totalJobs) * 100 : 0;
-        
-        // Update average processing time
-        if (processingTime !== null) {
-            worker.metrics.avgProcessingTime = worker.metrics.avgProcessingTime === 0
-                ? processingTime
-                : (worker.metrics.avgProcessingTime * 0.8) + (processingTime * 0.2);
-        }
-        
-        worker.metrics.lastCalculated = now;
-    }
-
-    /**
-     * Determine if a worker should be scaled
-     */
-    shouldScaleWorker(worker) {
-        const utilization = worker.activeJobs / worker.concurrency;
-        const errorRate = worker.metrics.errorRate;
-        const avgResponseTime = worker.metrics.avgProcessingTime;
-        
-        // Scale up conditions
-        if (utilization > 0.8 && errorRate < 5 && avgResponseTime < 30000) {
-            return { scale: true, direction: 'up', reason: 'High utilization, low errors' };
-        }
-        
-        // Scale down conditions
-        if (utilization < 0.2 && worker.concurrency > worker.minConcurrency) {
-            return { scale: true, direction: 'down', reason: 'Low utilization' };
-        }
-        
-        if (errorRate > 20) {
-            return { scale: true, direction: 'down', reason: 'High error rate' };
-        }
-        
-        if (avgResponseTime > 60000) {
-            return { scale: true, direction: 'down', reason: 'High response time' };
-        }
-        
-        return { scale: false };
-    }
-
-    /**
-     * Scale a worker up or down
-     */
-    scaleWorker(worker, direction, reason) {
         const oldConcurrency = worker.concurrency;
-        
-        if (direction === 'up') {
-            worker.concurrency = Math.min(
-                worker.maxConcurrency,
-                Math.floor(worker.concurrency * 1.2)
-            );
-        } else {
-            worker.concurrency = Math.max(
-                worker.minConcurrency,
-                Math.floor(worker.concurrency * 0.8)
-            );
-        }
+        worker.concurrency = Math.min(targetCount, worker.maxConcurrency);
         
         if (worker.concurrency !== oldConcurrency) {
-            console.log(`🔄 Scaled ${direction} '${worker.type}': ${oldConcurrency} → ${worker.concurrency} (${reason})`);
-            this.emit('workerScaled', { worker: worker.type, direction, oldConcurrency, newConcurrency: worker.concurrency, reason });
+            console.log(`🔄 Scaled '${workerType}': ${oldConcurrency} → ${worker.concurrency}`);
         }
+        
+        return worker.concurrency;
     }
 
     /**
-     * Handle circuit breaker state changes
+     * Get current status
      */
-    handleCircuitBreakerStateChange(workerType, oldState, newState) {
-        console.log(`🔀 Circuit breaker '${workerType}': ${oldState} → ${newState}`);
-        
-        if (newState === 'OPEN') {
-            // Scale down when circuit opens
-            const worker = this.workers.get(workerType);
-            if (worker) {
-                worker.concurrency = Math.max(worker.minConcurrency, Math.floor(worker.concurrency * 0.5));
-                console.log(`📉 Emergency scale down '${workerType}' concurrency to ${worker.concurrency}`);
-            }
+    getStatus() {
+        const workers = {};
+        for (const [type, worker] of this.workers) {
+            workers[type] = {
+                type: worker.type,
+                concurrency: worker.concurrency,
+                activeJobs: worker.activeJobs,
+                utilization: worker.concurrency > 0 ? (worker.activeJobs / worker.concurrency) * 100 : 0
+            };
         }
         
-        this.emit('circuitBreakerStateChange', { workerType, oldState, newState });
+        return {
+            globalConcurrency: {
+                current: this.currentConcurrency,
+                max: this.config.maxConcurrency,
+                utilization: (this.currentConcurrency / this.config.maxConcurrency) * 100
+            },
+            workers
+        };
     }
 
     /**
@@ -969,6 +370,344 @@ class WorkerPoolManager extends EventEmitter {
                 console.log(`📈 Restored ${worker.type} concurrency to ${worker.concurrency}`);
             }
         }
+    }
+
+    /**
+     * Wait for an available slot instead of throwing an error
+     */
+    async waitForAvailableSlot(workerType, jobData, maxWaitTime = 90000) { // Reduced to 90 seconds
+        const startWait = Date.now();
+        let checkInterval = 100; // Start with 100ms, will increase with exponential backoff
+        
+        while (Date.now() - startWait < maxWaitTime) {
+            const worker = this.workers.get(workerType);
+            if (!worker) {
+                throw new Error(`Unknown worker type: ${workerType}`);
+            }
+            
+            // Check if slot is now available
+            if (worker.activeJobs < worker.concurrency) {
+                // Recursively call requestJobSlot now that space is available
+                return await this.requestJobSlot(workerType, jobData);
+            }
+            
+            // Exponential backoff: increase wait time gradually to reduce CPU usage
+            checkInterval = Math.min(checkInterval * 1.1, 2000); // Cap at 2 seconds
+            await new Promise(resolve => setTimeout(resolve, checkInterval));
+        }
+        
+        // If we've waited too long, fall back to throwing error
+        throw new Error(`Timeout waiting for available slot for worker '${workerType}' after ${maxWaitTime}ms`);
+    }
+
+    /**
+     * Start slot cleanup process to detect and recover leaked slots
+     */
+    startSlotCleanup() {
+        if (this.slotCleanupInterval) {
+            clearInterval(this.slotCleanupInterval);
+        }
+        
+        this.slotCleanupInterval = setInterval(() => {
+            this.cleanupStalledSlots();
+        }, 60000); // Check every minute
+        
+        // Track the interval for cleanup
+        this.trackInterval(this.slotCleanupInterval, { name: 'slotCleanup' });
+        
+        console.log('🔧 Started slot cleanup monitoring');
+    }
+    
+    /**
+     * Clean up stalled slots that may have leaked
+     */
+    cleanupStalledSlots() {
+        let totalCleaned = 0;
+        
+        for (const [workerType, worker] of this.workers.entries()) {
+            // If activeJobs is significantly higher than it should be, reset it
+            const expectedMax = worker.concurrency;
+            
+            if (worker.activeJobs > expectedMax) {
+                const cleaned = worker.activeJobs - expectedMax;
+                console.warn(`🔧 Cleaning ${cleaned} stalled slots for worker '${workerType}' (had ${worker.activeJobs}, max is ${expectedMax})`);
+                
+                worker.activeJobs = Math.max(0, expectedMax);
+                this.currentConcurrency = Math.max(0, this.currentConcurrency - cleaned);
+                this.metrics.activeRequests = Math.max(0, this.metrics.activeRequests - cleaned);
+                
+                totalCleaned += cleaned;
+            }
+            
+            // Also check for workers with negative activeJobs (shouldn't happen but safety check)
+            if (worker.activeJobs < 0) {
+                console.warn(`🔧 Fixing negative activeJobs count for worker '${workerType}': ${worker.activeJobs} -> 0`);
+                worker.activeJobs = 0;
+            }
+        }
+        
+        if (totalCleaned > 0) {
+            console.log(`🔧 Slot cleanup completed: recovered ${totalCleaned} stalled slots`);
+            this.emit('slotsRecovered', { count: totalCleaned });
+        }
+    }
+
+    /**
+     * Reset all circuit breakers (useful after fixing underlying issues)
+     */
+    resetAllCircuitBreakers(reason = 'Manual reset after fixing underlying issues') {
+        console.log(`🔄 Resetting all circuit breakers: ${reason}`);
+        let resetCount = 0;
+        
+        for (const [workerType, worker] of this.workers.entries()) {
+            if (worker.circuitBreaker) {
+                const oldState = worker.circuitBreaker.state;
+                worker.circuitBreaker.reset();
+                
+                if (oldState !== 'CLOSED') {
+                    console.log(`✅ Reset circuit breaker for '${workerType}': ${oldState} → CLOSED`);
+                    resetCount++;
+                }
+            }
+        }
+        
+        console.log(`🔄 Circuit breaker reset complete: ${resetCount} breakers were reset`);
+        this.emit('circuitBreakersReset', { count: resetCount, reason });
+        
+        return resetCount;
+    }
+
+    /**
+     * Get circuit breaker status for all workers
+     */
+    getCircuitBreakerStatus() {
+        const status = {};
+        
+        for (const [workerType, worker] of this.workers.entries()) {
+            if (worker.circuitBreaker) {
+                const breakerStatus = worker.circuitBreaker.getStatus();
+                status[workerType] = {
+                    state: breakerStatus.state,
+                    failures: breakerStatus.failures,
+                    successes: breakerStatus.successes,
+                    nextAttempt: breakerStatus.nextAttempt,
+                    recoveryAttempts: breakerStatus.recoveryAttempts,
+                    maxRecoveryAttempts: breakerStatus.maxRecoveryAttempts,
+                    gradualRecoveryInProgress: breakerStatus.gradualRecoveryInProgress,
+                    timeToNextAttempt: breakerStatus.timeToNextAttempt,
+                    lastStateChange: breakerStatus.lastStateChange,
+                    stats: breakerStatus.stats,
+                    resetTimeout: worker.circuitBreaker.resetTimeout
+                };
+            }
+        }
+        
+        return status;
+    }
+
+    /**
+     * Manually trigger circuit breaker recovery for specific workers or all workers
+     */
+    async triggerCircuitBreakerRecovery(workerTypes = null) {
+        const { registry } = require('./circuitBreaker');
+        
+        try {
+            if (workerTypes && Array.isArray(workerTypes)) {
+                // Recovery for specific workers
+                const results = [];
+                for (const workerType of workerTypes) {
+                    const worker = this.workers.get(workerType);
+                    if (worker && worker.circuitBreaker) {
+                        if (worker.circuitBreaker.state === 'OPEN') {
+                            console.log(`🔄 Triggering recovery for circuit breaker '${workerType}'...`);
+                            worker.circuitBreaker.allowRequest(); // This will trigger recovery attempt if timeout passed
+                            results.push({ name: workerType, status: 'attempted', state: worker.circuitBreaker.state });
+                        } else {
+                            results.push({ name: workerType, status: 'not_needed', state: worker.circuitBreaker.state });
+                        }
+                    } else {
+                        results.push({ name: workerType, status: 'not_found' });
+                    }
+                }
+                return { success: true, results };
+            } else {
+                // Global recovery using registry
+                return await registry.attemptGlobalRecovery();
+            }
+        } catch (error) {
+            console.error('❌ Error triggering circuit breaker recovery:', error);
+            return { success: false, error: error.message };
+        }
+    }
+
+    /**
+     * Get health status of all circuit breakers
+     */
+    async getCircuitBreakerHealth() {
+        const { registry } = require('./circuitBreaker');
+        
+        try {
+            return await registry.healthCheckAll();
+        } catch (error) {
+            console.error('❌ Error checking circuit breaker health:', error);
+            return { healthy: false, error: error.message };
+        }
+    }
+
+    /**
+     * Track a worker instance for process monitoring
+     */
+    trackWorkerInstance(workerType, workerInstance, pid = null) {
+        if (this.processMonitor) {
+            const existingWorker = this.processMonitor.trackedWorkers.get(workerType);
+            if (existingWorker) {
+                existingWorker.workerInstance = workerInstance;
+                existingWorker.pid = pid;
+            }
+            
+            // Track any associated process
+            if (pid && typeof pid === 'number') {
+                this.processMonitor.trackProcess(pid, {
+                    name: `${workerType}-process`,
+                    type: 'worker_process',
+                    workerId: workerType,
+                    command: workerInstance.constructor?.name || 'unknown'
+                });
+            }
+        }
+        
+        console.log(`🔧 Tracked worker instance: ${workerType}${pid ? ` (PID: ${pid})` : ''}`);
+    }
+    
+    /**
+     * Track a timer or interval for cleanup
+     */
+    trackTimer(timerId, timerInfo = {}) {
+        if (this.processMonitor) {
+            return this.processMonitor.trackTimer(timerId, timerInfo);
+        }
+        return timerId;
+    }
+    
+    trackInterval(intervalId, intervalInfo = {}) {
+        if (this.processMonitor) {
+            return this.processMonitor.trackInterval(intervalId, intervalInfo);
+        }
+        return intervalId;
+    }
+    
+    /**
+     * Untrack a worker when it shuts down
+     */
+    untrackWorker(workerType) {
+        if (this.processMonitor) {
+            this.processMonitor.untrackWorker(workerType);
+        }
+        console.log(`🔧 Untracked worker: ${workerType}`);
+    }
+    
+    /**
+     * Get process monitoring status
+     */
+    getProcessMonitorStatus() {
+        return this.processMonitor ? this.processMonitor.getStatus() : null;
+    }
+    
+    /**
+     * Verify clean shutdown - check for zombie processes
+     */
+    async verifyCleanShutdown() {
+        if (this.processMonitor) {
+            return await this.processMonitor.verifyCleanShutdown();
+        }
+        return { clean: true, zombies: [], orphanedTimers: [] };
+    }
+    
+    /**
+     * Force kill any zombie processes
+     */
+    async forceKillZombies() {
+        if (this.processMonitor) {
+            return await this.processMonitor.forceKillZombies();
+        }
+        return { success: true, killed: [], failed: [] };
+    }
+    
+    /**
+     * Enhanced shutdown with zombie process detection and cleanup
+     */
+    async shutdown() {
+        console.log('🛑 Shutting down WorkerPoolManager with process monitoring...');
+        
+        // Track cleanup intervals as timers for monitoring
+        const intervals = [this.resourceMonitor, this.adaptiveScaler, this.slotCleanupInterval].filter(Boolean);
+        intervals.forEach(interval => {
+            if (this.processMonitor) {
+                this.processMonitor.trackInterval(interval, { name: 'workerPoolCleanup' });
+            }
+        });
+        
+        // Stop monitoring
+        if (this.resourceMonitor) {
+            clearInterval(this.resourceMonitor);
+            this.resourceMonitor = null;
+        }
+        
+        if (this.adaptiveScaler) {
+            clearInterval(this.adaptiveScaler);
+            this.adaptiveScaler = null;
+        }
+        
+        if (this.slotCleanupInterval) {
+            clearInterval(this.slotCleanupInterval);
+            this.slotCleanupInterval = null;
+        }
+        
+        // Wait for active jobs to complete (with timeout)
+        const timeout = 30000; // 30 seconds
+        const startTime = Date.now();
+        
+        while (this.currentConcurrency > 0 && (Date.now() - startTime) < timeout) {
+            console.log(`⏳ Waiting for ${this.currentConcurrency} active jobs to complete...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
+        // Untrack all workers
+        for (const workerType of this.workers.keys()) {
+            this.untrackWorker(workerType);
+        }
+        
+        // Force close circuit breakers
+        registry.resetAll();
+        
+        // Use ProcessMonitor for graceful shutdown verification
+        if (this.processMonitor) {
+            try {
+                const verification = await this.verifyCleanShutdown();
+                
+                if (!verification.clean) {
+                    console.warn(`⚠️ Found ${verification.zombies.length} zombie processes during WorkerPoolManager shutdown`);
+                    const killResult = await this.forceKillZombies();
+                    
+                    if (killResult.failed.length > 0) {
+                        console.error(`❌ Failed to kill ${killResult.failed.length} zombie processes`);
+                        console.error('Zombie processes that could not be killed:', killResult.failed);
+                    } else {
+                        console.log(`✅ Successfully cleaned up ${killResult.killed.length} zombie processes`);
+                    }
+                }
+                
+                // Shutdown the process monitor itself
+                await this.processMonitor.shutdown();
+                
+            } catch (error) {
+                console.error('❌ Error during zombie process cleanup:', error.message);
+                throw error;
+            }
+        }
+        
+        console.log('✅ WorkerPoolManager shutdown complete');
+        this.emit('shutdown');
     }
 }
 

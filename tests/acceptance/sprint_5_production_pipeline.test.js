@@ -174,7 +174,7 @@ describe('Production E2E Pipeline Test', () => {
                 (3, 'file1.js', 'poi-3', 'Function', 3, 3, 'hash3');
             `);
             db.exec(`
-                INSERT INTO relationships (source_poi_id, target_poi_id, type, confidence_score, status) VALUES
+                INSERT INTO relationships (source_poi_id, target_poi_id, type, confidence, status) VALUES
                 (1, 2, 'CALLS', 0.9, 'VALIDATED'),
                 (2, 3, 'READS', 0.8, 'VALIDATED');
             `);

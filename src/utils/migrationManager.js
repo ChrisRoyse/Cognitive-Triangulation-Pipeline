@@ -103,7 +103,8 @@ class MigrationManager {
         try {
             // Load and instantiate the migration
             const MigrationClass = require(migration.fullPath);
-            const migrationInstance = new MigrationClass.Migration001(this.db);
+            const className = `Migration${migration.version}`;
+            const migrationInstance = new MigrationClass[className](this.db);
             
             // Check if migration is needed
             if (typeof migrationInstance.isNeeded === 'function' && !migrationInstance.isNeeded()) {

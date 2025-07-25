@@ -13,6 +13,8 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs').promises;
 const { spawn } = require('child_process');
+const os = require('os');
+const { PerformanceMonitor } = require('./performanceMonitor');
 
 class PipelineApiService {
     constructor(port = 3002) {
@@ -24,6 +26,14 @@ class PipelineApiService {
         // Track active pipeline runs
         this.activePipelines = new Map(); // pipelineId -> pipeline status
         this.clients = new Set(); // WebSocket clients for real-time updates
+        this.pipelineCounter = 0; // Total pipelines created
+        
+        // Initialize performance monitor
+        this.performanceMonitor = new PerformanceMonitor('PipelineAPI');
+        this.performanceMonitor.startMonitoring();
+        
+        // Initialize queue manager reference (will be set when available)
+        this.queueManager = null;
         
         this.setupMiddleware();
         this.setupRoutes();
@@ -87,6 +97,9 @@ class PipelineApiService {
                         status: this.activePipelines.get(id).status
                     });
                 }
+
+                // Increment pipeline counter
+                this.pipelineCounter++;
 
                 // Start pipeline asynchronously
                 this.startPipelineAsync(id, targetDirectory);
@@ -180,6 +193,33 @@ class PipelineApiService {
                 message: 'Pipeline cleared',
                 pipelineId: pipelineId
             });
+        });
+
+        // Metrics endpoint for monitoring tools (Prometheus, Grafana, etc.)
+        this.app.get('/metrics', async (req, res) => {
+            try {
+                const metrics = {
+                    timestamp: new Date().toISOString(),
+                    system: this.getSystemMetrics(),
+                    performance: this.performanceMonitor ? this.performanceMonitor.generateReport() : {},
+                    pipelines: {
+                        active: this.activePipelines.size,
+                        total: this.pipelineCounter || 0,
+                        byStatus: this.getPipelineStatusCounts()
+                    },
+                    queues: await this.getQueueMetrics(),
+                    database: await this.getDatabaseMetrics(),
+                    workers: this.getWorkerMetrics()
+                };
+                
+                res.json(metrics);
+            } catch (error) {
+                console.error('Failed to collect metrics:', error);
+                res.status(500).json({ 
+                    error: 'Failed to collect metrics',
+                    details: error.message 
+                });
+            }
         });
     }
 
@@ -288,9 +328,17 @@ class PipelineApiService {
             // Get GraphBuilder results from Neo4j
             const neo4jDriver = require('./neo4jDriver');
             const session = neo4jDriver.session();
+            const txConfig = {
+                timeout: 30000, // 30 seconds for count queries
+                metadata: { operation: 'count-nodes-relationships' }
+            };
+            
             try {
-                const nodeResult = await session.run('MATCH (n) RETURN count(n) as count');
-                const relationshipResult = await session.run('MATCH ()-[r]->() RETURN count(r) as count');
+                const [nodeResult, relationshipResult] = await session.readTransaction(async (tx) => {
+                    const nodeRes = await tx.run('MATCH (n) RETURN count(n) as count');
+                    const relRes = await tx.run('MATCH ()-[r]->() RETURN count(r) as count');
+                    return [nodeRes, relRes];
+                }, txConfig);
                 
                 const nodeCount = nodeResult.records[0].get('count').toNumber();
                 const relationshipCount = relationshipResult.records[0].get('count').toNumber();
@@ -315,8 +363,15 @@ class PipelineApiService {
             
             // Get final relationship count
             const session2 = neo4jDriver.session();
+            const txConfig2 = {
+                timeout: 30000, // 30 seconds for count query
+                metadata: { operation: 'count-final-relationships' }
+            };
+            
             try {
-                const finalRelationshipResult = await session2.run('MATCH ()-[r]->() RETURN count(r) as count');
+                const finalRelationshipResult = await session2.readTransaction(async (tx) => {
+                    return await tx.run('MATCH ()-[r]->() RETURN count(r) as count');
+                }, txConfig2);
                 const finalRelationshipCount = finalRelationshipResult.records[0].get('count').toNumber();
                 
                 this.updatePipelineStatus(pipelineId, {
@@ -413,6 +468,7 @@ class PipelineApiService {
             console.log(`   POST /api/pipeline/stop/:id - Stop pipeline`);
             console.log(`   DELETE /api/pipeline/clear/:id - Clear pipeline history`);
             console.log(`   GET  /health - Health check`);
+            console.log(`   GET  /metrics - System and performance metrics for monitoring tools`);
         });
 
         // Handle graceful shutdown
@@ -434,11 +490,216 @@ class PipelineApiService {
         });
         this.clients.clear();
         
+        console.log('Stopping performance monitor...');
+        if (this.performanceMonitor) {
+            this.performanceMonitor.stopMonitoring();
+        }
+        
         console.log('Closing server...');
         this.server.close();
         
         console.log('Pipeline API Server shutdown complete');
         process.exit(0);
+    }
+
+    // Helper methods for metrics collection
+
+    getSystemMetrics() {
+        const cpus = os.cpus();
+        const totalMemory = os.totalmem();
+        const freeMemory = os.freemem();
+        const usedMemory = totalMemory - freeMemory;
+        const memoryUsage = process.memoryUsage();
+
+        return {
+            cpu: {
+                count: cpus.length,
+                model: cpus[0]?.model || 'Unknown',
+                usage: this.calculateCPUUsage(),
+                loadAverage: os.loadavg()
+            },
+            memory: {
+                total: Math.round(totalMemory / (1024 * 1024)), // MB
+                free: Math.round(freeMemory / (1024 * 1024)), // MB
+                used: Math.round(usedMemory / (1024 * 1024)), // MB
+                usagePercent: ((usedMemory / totalMemory) * 100).toFixed(2),
+                process: {
+                    rss: Math.round(memoryUsage.rss / (1024 * 1024)), // MB
+                    heapTotal: Math.round(memoryUsage.heapTotal / (1024 * 1024)), // MB
+                    heapUsed: Math.round(memoryUsage.heapUsed / (1024 * 1024)), // MB
+                    external: Math.round(memoryUsage.external / (1024 * 1024)) // MB
+                }
+            },
+            disk: this.getDiskUsage(),
+            uptime: {
+                system: os.uptime(),
+                process: process.uptime()
+            },
+            platform: {
+                type: os.type(),
+                platform: os.platform(),
+                release: os.release(),
+                hostname: os.hostname()
+            }
+        };
+    }
+
+    calculateCPUUsage() {
+        // Simple CPU usage calculation
+        const cpus = os.cpus();
+        let totalIdle = 0;
+        let totalTick = 0;
+
+        cpus.forEach(cpu => {
+            for (const type in cpu.times) {
+                totalTick += cpu.times[type];
+            }
+            totalIdle += cpu.times.idle;
+        });
+
+        const idle = totalIdle / cpus.length;
+        const total = totalTick / cpus.length;
+        const usage = 100 - ~~(100 * idle / total);
+
+        return {
+            percent: usage,
+            cores: cpus.map((cpu, i) => ({
+                core: i,
+                model: cpu.model,
+                speed: cpu.speed
+            }))
+        };
+    }
+
+    getDiskUsage() {
+        // Note: This is a placeholder. Real implementation would need platform-specific code
+        // or a library like 'diskusage' for accurate disk metrics
+        return {
+            note: 'Disk metrics require platform-specific implementation',
+            available: true
+        };
+    }
+
+    getPipelineStatusCounts() {
+        const counts = {
+            running: 0,
+            completed: 0,
+            failed: 0,
+            starting: 0,
+            stopping: 0
+        };
+
+        this.activePipelines.forEach(pipeline => {
+            const status = pipeline.status || 'unknown';
+            if (counts.hasOwnProperty(status)) {
+                counts[status]++;
+            }
+        });
+
+        return counts;
+    }
+
+    async getQueueMetrics() {
+        if (!this.queueManager) {
+            return {
+                available: false,
+                message: 'Queue manager not initialized'
+            };
+        }
+
+        try {
+            // This would depend on the actual QueueManager implementation
+            return {
+                available: true,
+                queues: {
+                    // Placeholder - actual implementation would query queue manager
+                    fileAnalysis: { waiting: 0, active: 0, completed: 0 },
+                    relationshipResolution: { waiting: 0, active: 0, completed: 0 },
+                    graphBuilder: { waiting: 0, active: 0, completed: 0 }
+                }
+            };
+        } catch (error) {
+            return {
+                available: false,
+                error: error.message
+            };
+        }
+    }
+
+    async getDatabaseMetrics() {
+        const metrics = {
+            sqlite: { connected: false },
+            neo4j: { connected: false }
+        };
+
+        try {
+            // Check SQLite connection
+            const ProductionAgentFactory = require('./productionAgentFactory');
+            const factory = new ProductionAgentFactory();
+            const db = await factory.getSqliteConnection();
+            
+            if (db) {
+                metrics.sqlite.connected = true;
+                
+                // Get basic stats
+                try {
+                    const [fileCount] = await db.all("SELECT COUNT(*) as count FROM files");
+                    const [entityCount] = await db.all("SELECT COUNT(*) as count FROM entity_reports");
+                    const [jobCount] = await db.all("SELECT COUNT(*) as count FROM jobs");
+                    
+                    metrics.sqlite.stats = {
+                        files: fileCount.count,
+                        entities: entityCount.count,
+                        jobs: jobCount.count
+                    };
+                } catch (e) {
+                    metrics.sqlite.error = e.message;
+                }
+            }
+
+            // Check Neo4j connection
+            try {
+                const neo4jDriver = require('./neo4jDriver');
+                const session = neo4jDriver.session();
+                const result = await session.run('RETURN 1 as test');
+                await session.close();
+                
+                if (result) {
+                    metrics.neo4j.connected = true;
+                    
+                    // Get basic stats
+                    const session2 = neo4jDriver.session();
+                    try {
+                        const nodeResult = await session2.run('MATCH (n) RETURN count(n) as count');
+                        const relResult = await session2.run('MATCH ()-[r]->() RETURN count(r) as count');
+                        
+                        metrics.neo4j.stats = {
+                            nodes: nodeResult.records[0].get('count').toNumber(),
+                            relationships: relResult.records[0].get('count').toNumber()
+                        };
+                    } catch (e) {
+                        metrics.neo4j.error = e.message;
+                    } finally {
+                        await session2.close();
+                    }
+                }
+            } catch (error) {
+                metrics.neo4j.error = error.message;
+            }
+        } catch (error) {
+            console.error('Error collecting database metrics:', error);
+        }
+
+        return metrics;
+    }
+
+    getWorkerMetrics() {
+        // Placeholder for worker metrics
+        return {
+            available: false,
+            message: 'Worker metrics not yet implemented',
+            suggestion: 'Integrate with worker pool manager for detailed metrics'
+        };
     }
 }
 

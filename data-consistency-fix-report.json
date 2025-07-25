@@ -1,0 +1,34 @@
+{
+  "timestamp": "2025-07-25T01:43:57.572Z",
+  "database_path": "C:\\code\\ctp\\stress-test-temp\\large-dataset-stress.db",
+  "issues_found": 2,
+  "fixes_applied": 7,
+  "issues": [
+    {
+      "type": "MISSING_CONFIDENCE_TABLES",
+      "severity": "HIGH",
+      "description": "Missing tables required for confidence scoring: relationship_evidence_tracking, triangulated_analysis_sessions, subagent_analyses, consensus_decisions"
+    },
+    {
+      "type": "RELATIONSHIPS_WITHOUT_EVIDENCE",
+      "severity": "HIGH",
+      "description": "4979 relationships have confidence scores but no supporting evidence",
+      "count": 4979
+    }
+  ],
+  "fixes": [
+    "Reset confidence scores for 4979 relationships without evidence",
+    "Created index: IF",
+    "Created index: IF",
+    "Created index: IF",
+    "Added column evidence_hash to relationships",
+    "Added column analysis_quality_score to pois",
+    "Added column validation_timestamp to relationships"
+  ],
+  "recommendations": [
+    "Run pipeline validation tests to ensure fixes are working correctly",
+    "Monitor confidence scoring to ensure evidence is properly collected",
+    "Verify graph building only processes validated relationships",
+    "Consider implementing database integrity checks in the pipeline"
+  ]
+}

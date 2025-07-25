@@ -1,0 +1,147 @@
+{
+  "timestamp": "2025-07-25T01:43:15.010Z",
+  "database_path": "C:\\code\\ctp\\edge-case-test-temp\\malformed-test.db",
+  "summary": {
+    "total_tests": 27,
+    "passed": 15,
+    "failed": 12,
+    "success_rate": "55.6%"
+  },
+  "tests": [
+    {
+      "name": "Database file exists",
+      "passed": true,
+      "description": "Database should exist at C:\\code\\ctp\\edge-case-test-temp\\malformed-test.db"
+    },
+    {
+      "name": "Database has data",
+      "passed": true,
+      "description": "Database file should not be empty"
+    },
+    {
+      "name": "Data directory exists",
+      "passed": true,
+      "description": "Data directory should exist at C:\\code\\ctp\\edge-case-test-temp"
+    },
+    {
+      "name": "Table files exists",
+      "passed": false,
+      "description": "Required table files should exist"
+    },
+    {
+      "name": "Table pois exists",
+      "passed": true,
+      "description": "Required table pois should exist"
+    },
+    {
+      "name": "Table relationships exists",
+      "passed": true,
+      "description": "Required table relationships should exist"
+    },
+    {
+      "name": "Table relationship_evidence exists",
+      "passed": true,
+      "description": "Required table relationship_evidence should exist"
+    },
+    {
+      "name": "Table relationship_evidence_tracking exists",
+      "passed": false,
+      "description": "Required table relationship_evidence_tracking should exist"
+    },
+    {
+      "name": "Table triangulated_analysis_sessions exists",
+      "passed": false,
+      "description": "Required table triangulated_analysis_sessions should exist"
+    },
+    {
+      "name": "Table subagent_analyses exists",
+      "passed": false,
+      "description": "Required table subagent_analyses should exist"
+    },
+    {
+      "name": "Table consensus_decisions exists",
+      "passed": false,
+      "description": "Required table consensus_decisions should exist"
+    },
+    {
+      "name": "Column relationships.evidence_hash exists",
+      "passed": true,
+      "description": "New column evidence_hash should exist in relationships table"
+    },
+    {
+      "name": "Column pois.analysis_quality_score exists",
+      "passed": true,
+      "description": "New column analysis_quality_score should exist in pois table"
+    },
+    {
+      "name": "Column relationships.validation_timestamp exists",
+      "passed": true,
+      "description": "New column validation_timestamp should exist in relationships table"
+    },
+    {
+      "name": "No relationships with confidence but no evidence",
+      "passed": true,
+      "description": "Found 0 relationships with confidence scores but no evidence"
+    },
+    {
+      "name": "All confidence scores in valid range (0-1)",
+      "passed": true,
+      "description": "Found 0 relationships with confidence scores outside 0-1 range"
+    },
+    {
+      "name": "No validated relationships with missing POI references",
+      "passed": true,
+      "description": "Found 0 validated relationships referencing non-existent POIs"
+    },
+    {
+      "name": "All validated relationships have valid confidence",
+      "passed": true,
+      "description": "Found 0 validated relationships with invalid confidence"
+    },
+    {
+      "name": "All validated relationships have types",
+      "passed": true,
+      "description": "Found 0 validated relationships without types"
+    },
+    {
+      "name": "POIs referenced by validated relationships have complete data",
+      "passed": true,
+      "description": "Found 0 POIs with missing data referenced by validated relationships"
+    },
+    {
+      "name": "Index idx_relationships_status exists",
+      "passed": false,
+      "description": "Performance index idx_relationships_status should exist"
+    },
+    {
+      "name": "Index idx_pois_file_id exists",
+      "passed": false,
+      "description": "Performance index idx_pois_file_id should exist"
+    },
+    {
+      "name": "Index idx_pois_run_id exists",
+      "passed": false,
+      "description": "Performance index idx_pois_run_id should exist"
+    },
+    {
+      "name": "Index idx_relationships_run_id exists",
+      "passed": false,
+      "description": "Performance index idx_relationships_run_id should exist"
+    },
+    {
+      "name": "Index idx_pois_semantic_id exists",
+      "passed": false,
+      "description": "Performance index idx_pois_semantic_id should exist"
+    },
+    {
+      "name": "Index idx_relationships_confidence_desc exists",
+      "passed": false,
+      "description": "Performance index idx_relationships_confidence_desc should exist"
+    },
+    {
+      "name": "Query uses status index",
+      "passed": false,
+      "description": "Queries on relationship status should use index"
+    }
+  ]
+}
